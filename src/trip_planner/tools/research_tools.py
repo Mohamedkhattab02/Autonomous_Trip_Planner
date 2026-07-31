@@ -35,21 +35,28 @@ def _client() -> TavilyClient:
     return TavilyClient()
 
 
-def _search(query: str) -> dict:
+def tavily_web_search(query: str) -> dict:
     """Run one Tavily search and reduce it to the fields agents use.
+
+    Shared with the Attractions and Critic agents, which search the web for
+    facts that the structured Google endpoints do not cover.
 
     Args:
         query: The search query.
 
     Returns:
         A dict with Tavily's generated `answer` and a `sources` list of
-        {title, url, content} entries.
+        {title, url, content} entries, or `error` when the search failed.
     """
-    response = _client().search(
-        query=query,
-        max_results=MAX_RESULTS,
-        include_answer=True,
-    )
+    try:
+        response = _client().search(
+            query=query,
+            max_results=MAX_RESULTS,
+            include_answer=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure degrades the same way
+        return {"error": f"Tavily search failed: {exc}", "answer": "", "sources": []}
+
     return {
         "answer": response.get("answer") or "",
         "sources": [
@@ -73,7 +80,7 @@ def tavily_search(query: str) -> dict:
     Returns:
         A summarized answer plus the sources it came from.
     """
-    return _search(query)
+    return tavily_web_search(query)
 
 
 @tool
@@ -87,7 +94,7 @@ def get_weather(destination: str, travel_dates: str) -> dict:
     Returns:
         A weather summary plus the sources it came from.
     """
-    return _search(
+    return tavily_web_search(
         f"weather in {destination} during {travel_dates} temperature and rainfall"
     )
 
@@ -104,7 +111,7 @@ def get_entry_requirements(destination: str, nationality: str = "unspecified") -
         An entry-requirements summary plus the sources it came from.
     """
     who = "" if nationality == "unspecified" else f" for {nationality} citizens"
-    return _search(f"visa and entry requirements for {destination}{who} passport rules")
+    return tavily_web_search(f"visa and entry requirements for {destination}{who} passport rules")
 
 
 @tool
@@ -117,7 +124,7 @@ def get_currency_info(destination: str) -> dict:
     Returns:
         A currency summary plus the sources it came from.
     """
-    return _search(
+    return tavily_web_search(
         f"local currency in {destination} exchange rate and card payment acceptance"
     )
 

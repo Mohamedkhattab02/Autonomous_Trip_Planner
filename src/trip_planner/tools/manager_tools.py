@@ -19,7 +19,95 @@ from trip_planner.state import TripState
 AGENT_SEQUENCE: tuple[AgentName, ...] = (
     AgentName.INTAKE,
     AgentName.DESTINATION_RESEARCH,
+    AgentName.FLIGHTS,
+    AgentName.LODGING,
+    AgentName.ATTRACTIONS,
+    AgentName.ROUTING,
+    AgentName.BUDGET,
+    AgentName.CRITIC,
+    AgentName.ITINERARY,
+    AgentName.CALENDAR,
 )
+
+
+def _summarize(state: TripState) -> dict:
+    """Summarize every agent's output without dumping it all into context.
+
+    The manager only needs to know what exists and whether it succeeded, not
+    the full contents - those belong to the agent that consumes them.
+
+    Args:
+        state: The state as seen by the manager on this turn.
+
+    Returns:
+        One short entry per stage that has produced something.
+    """
+    summary: dict = {}
+
+    intake = state.get("intake")
+    if intake is not None:
+        summary["intake"] = {
+            "is_complete": intake.is_complete,
+            "missing_fields": intake.missing_fields,
+            "destination": intake.profile.destination,
+        }
+
+    if state.get("research") is not None:
+        summary["destination_research"] = {"done": True}
+
+    flights = state.get("flights")
+    if flights is not None:
+        summary["flights"] = {
+            "option_count": len(flights.options),
+            "recommended": flights.recommended_option_id,
+        }
+
+    lodging = state.get("lodging")
+    if lodging is not None:
+        summary["lodging"] = {
+            "option_count": len(lodging.options),
+            "recommended": lodging.recommended_option_id,
+        }
+
+    attractions = state.get("attractions")
+    if attractions is not None:
+        summary["attractions"] = {"place_count": len(attractions.places)}
+
+    routing = state.get("routing")
+    if routing is not None:
+        summary["routing"] = {
+            "day_count": len(routing.days),
+            "stop_count": sum(len(day.stops) for day in routing.days),
+        }
+
+    budget = state.get("budget")
+    if budget is not None:
+        summary["budget"] = {
+            "total_cost": budget.total_cost,
+            "currency": budget.currency,
+            "within_budget": budget.within_budget,
+        }
+
+    critic = state.get("critic")
+    if critic is not None:
+        summary["critic"] = {
+            "approved": critic.approved,
+            "blocker_count": len(critic.blockers),
+            "issue_count": len(critic.issues),
+        }
+
+    itinerary = state.get("itinerary")
+    if itinerary is not None:
+        summary["itinerary"] = {"title": itinerary.title, "day_count": len(itinerary.days)}
+
+    calendar = state.get("calendar")
+    if calendar is not None:
+        summary["calendar"] = {
+            "event_count": len(calendar.events),
+            "ics_path": calendar.ics_path,
+        }
+
+    return summary
 
 
 def make_read_trip_state(state: TripState) -> Callable:
@@ -37,18 +125,16 @@ def make_read_trip_state(state: TripState) -> Callable:
         """Read what the trip planner knows so far and which agents have run.
 
         Returns:
-            The user's request, the agents already completed, and a summary
-            of each agent's output.
+            The user's request, the agents already completed, how many times
+            the plan has been revised, and a summary of each agent's output.
         """
-        intake = state.get("intake")
-        research = state.get("research")
         return {
             "user_request": state.get("user_request", ""),
             "completed_agents": [
                 str(name) for name in state.get("completed_agents", [])
             ],
-            "intake": intake.model_dump(mode="json") if intake else None,
-            "research_done": research is not None,
+            "revision_count": state.get("revision_count", 0),
+            "results": _summarize(state),
         }
 
     return read_trip_state
@@ -59,7 +145,7 @@ def delegate_to_agent(agent: str, reason: str) -> str:
     """Record the decision to hand the next step to a specific agent.
 
     Args:
-        agent: The agent to run next. One of "intake", "destination_research".
+        agent: The agent to run next, e.g. "intake", "flights", "critic".
         reason: Why this agent should run now.
 
     Returns:

@@ -15,9 +15,17 @@ from langgraph.graph.message import add_messages
 
 from trip_planner.schemas import (
     AgentName,
+    AttractionsResult,
+    BudgetResult,
+    CalendarResult,
+    CriticResult,
     DestinationResearch,
+    FlightsResult,
     IntakeResult,
+    ItineraryResult,
+    LodgingResult,
     ManagerDecision,
+    RoutingResult,
 )
 
 
@@ -34,6 +42,18 @@ class TripState(TypedDict, total=False):
     manager_decision: ManagerDecision
     intake: IntakeResult
     research: DestinationResearch
+    flights: FlightsResult
+    lodging: LodgingResult
+    attractions: AttractionsResult
+    routing: RoutingResult
+    budget: BudgetResult
+    critic: CriticResult
+    itinerary: ItineraryResult
+    calendar: CalendarResult
 
     # Which agents have finished, in order. Drives the manager's routing.
     completed_agents: Annotated[list[AgentName], operator.add]
+
+    # How many times the Critic sent the plan back for a fix. Bounds the
+    # critic -> routing -> critic loop so a stubborn plan cannot spin forever.
+    revision_count: int
