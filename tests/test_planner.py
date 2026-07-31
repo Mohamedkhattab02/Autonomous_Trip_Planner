@@ -13,6 +13,7 @@ Two layers:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 
 import pytest
@@ -38,11 +39,34 @@ from trip_planner.graph import (
     app,
     plan_trip,
 )
+from trip_planner.mcp_client import (
+    calendar_server_config,
+    is_calendar_mcp_enabled,
+    load_calendar_tools,
+    run_async,
+)
+from trip_planner.render import (
+    PIPELINE,
+    progress_html,
+    render_budget,
+    render_calendar,
+    render_critic,
+    render_flights,
+    render_itinerary,
+    render_lodging,
+    render_places,
+    render_profile,
+)
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
+    BudgetLine,
+    BudgetResult,
     CriticResult,
     DestinationResearch,
+    FlightLeg,
+    FlightOption,
+    FlightsResult,
     IntakeResult,
     Issue,
     ManagerDecision,
@@ -768,6 +792,129 @@ class TestCalendarTools:
 
     def test_exporting_nothing_is_an_error(self):
         assert "error" in export_ics.invoke({})
+
+
+# ---------------------------------------------------------------------------
+# MCP integration
+# ---------------------------------------------------------------------------
+
+
+class TestMcpLayer:
+    """The calendar backend must degrade rather than fail."""
+
+    def test_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("CALENDAR_MCP_ENABLED", raising=False)
+        assert calendar_server_config() is None
+        assert is_calendar_mcp_enabled() is False
+
+    def test_builds_a_stdio_config_when_enabled(self, monkeypatch):
+        monkeypatch.setenv("CALENDAR_MCP_ENABLED", "true")
+        monkeypatch.setenv("CALENDAR_MCP_COMMAND", "node")
+        config = calendar_server_config()
+        assert config is not None
+        assert config["transport"] == "stdio"
+        assert config["command"].lower().endswith(("node", "node.exe"))
+
+    def test_falls_back_when_the_command_is_missing(self, monkeypatch):
+        """A misconfigured server must not take the planner down with it."""
+        monkeypatch.setenv("CALENDAR_MCP_ENABLED", "true")
+        monkeypatch.setenv("CALENDAR_MCP_COMMAND", "definitely-not-a-real-binary")
+        assert calendar_server_config() is None
+
+    def test_falls_back_to_the_local_ics_tools(self, monkeypatch):
+        monkeypatch.delenv("CALENDAR_MCP_ENABLED", raising=False)
+        tools, using_mcp = load_calendar_tools(force_reload=True)
+        assert using_mcp is False
+        assert {tool.name for tool in tools} == {
+            "create_calendar_event",
+            "update_event",
+            "export_ics",
+        }
+
+    def test_run_async_works_without_a_running_loop(self):
+        async def answer() -> int:
+            return 42
+
+        assert run_async(answer()) == 42
+
+    def test_run_async_works_inside_a_running_loop(self):
+        """The Gradio server already owns a loop, so this path must work too."""
+
+        async def answer() -> int:
+            return 42
+
+        async def outer() -> int:
+            return run_async(answer())
+
+        assert asyncio.run(outer()) == 42
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+class TestRendering:
+    """The frontend must render partial state without crashing."""
+
+    def test_every_panel_handles_a_missing_stage(self):
+        """Panels are drawn while the run is still in progress."""
+        assert render_profile(None)
+        assert render_flights(None)
+        assert render_lodging(None)
+        assert render_places(None)
+        assert render_budget(None)
+        assert render_critic(None)
+        assert render_itinerary(None, None)
+        assert render_calendar(None, "local")
+
+    def test_renders_a_flight_with_its_recommendation(self):
+        flights = FlightsResult(
+            options=[
+                FlightOption(
+                    option_id="flight-1",
+                    legs=[
+                        FlightLeg(
+                            airline="TAP",
+                            flight_number="TP 1",
+                            departure_airport="TLV",
+                            arrival_airport="LIS",
+                            departure_time="2026-09-10 16:05",
+                            arrival_time="2026-09-10 20:20",
+                            duration_minutes=315,
+                        )
+                    ],
+                    stops=0,
+                    total_duration_minutes=315,
+                    price=617,
+                    currency="USD",
+                )
+            ],
+            recommended_option_id="flight-1",
+            reasoning="Cheapest direct.",
+        )
+        output = render_flights(flights)
+        assert "617" in output
+        assert "Direct" in output
+        assert "Recommended" in output
+
+    def test_flags_an_over_budget_trip(self):
+        budget = BudgetResult(
+            lines=[BudgetLine(category="flights", amount=3500)],
+            total_cost=3500,
+            budget_amount=3000,
+            currency="USD",
+            within_budget=False,
+            overage=500,
+            reasoning="over",
+        )
+        assert "Over budget" in render_budget(budget)
+
+    def test_progress_tracker_marks_done_active_and_idle(self):
+        html = progress_html([AgentName.INTAKE, AgentName.FLIGHTS], active="lodging")
+        assert html.count("chip-done") == 2
+        assert html.count("chip-active") == 1
+        assert html.count("chip-idle") == len(PIPELINE) - 3
 
 
 # ---------------------------------------------------------------------------

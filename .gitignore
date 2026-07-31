@@ -8,10 +8,21 @@ wheels/
 
 # Virtual environments
 .venv
-# Environment variables
+# Environment variables. `.env.example` is documentation, so it stays.
 .env
 .env.*
+!.env.example
+
+# Google Calendar MCP credentials and the tokens it stores after the OAuth
+# consent screen. These are secrets: never commit them.
+gcp-oauth.keys.json
+*oauth*.json
+.gcp-saved-tokens.json
 
 # Generated artifacts
 graph.png
 .pytest_cache/
+exports/
+credentials/
+gcp-oauth.keys.json
+tokens.json

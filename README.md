@@ -2,11 +2,11 @@
 
 # ✈️ Autonomous Trip Planner
 
-**Eleven specialist agents that plan a real trip — from one sentence to a calendar file.**
+**Eleven specialist agents that plan a real trip — from one sentence to your Google Calendar.**
 
-`LangGraph` · `Gemini 2.5 Flash` · `Pydantic` · grounded in live travel data
+`LangGraph` · `Gemini 3.5 Flash` · `Pydantic` · `MCP` · `Gradio` · grounded in live travel data
 
-[🏗 Architecture](#-architecture) · [🤖 Agents](#-the-eleven-agents) · [🧰 Tools](#-the-tool-layer) · [🎯 Principles](#-two-design-principles) · [🧪 Tests](#-tests) · [🚀 Start](#-quick-start)
+[🏗 Architecture](#-architecture) · [🤖 Agents](#-the-eleven-agents) · [🧰 Tools](#-the-tool-layer) · [🔌 MCP](#-mcp--google-calendar) · [🖥 Interface](#-the-interface) · [🎯 Principles](#-two-design-principles) · [🧪 Tests](#-tests) · [🚀 Start](#-quick-start)
 
 </div>
 
@@ -21,7 +21,7 @@ You write one sentence:
 Eleven agents turn it into a trip that actually works — real flights at real
 prices, a real hotel, real museums with their real closing days, arranged into
 days you can genuinely walk, costed against your budget, fact-checked, written
-up, and exported as a `.ics` file.
+up, and written **straight into your Google Calendar** over MCP.
 
 **Nothing in the output is invented.** Every flight, hotel, place and price
 comes from a live API call, and every agent is told the same thing: *if the
@@ -132,7 +132,7 @@ boundary** instead of surfacing three stages later as a mystery.
 | 8 | 💰 **Budget** | Totals every category, converts currencies, proposes cuts when over. | `calculate_total_cost` `convert_currency` `estimate_food_cost` `estimate_local_transport_cost` `suggest_cheaper_alternatives` | `BudgetResult` |
 | 9 | 🔍 **Critic** | The gate. Verifies the plan is real, possible and within limits. | `verify_place` `verify_opening_hours` `validate_schedule` `validate_budget` | `CriticResult` |
 | 10 | 📖 **Itinerary** | Merges everything into the one document a person actually reads. | `read_agent_results` `build_daily_itinerary` `format_trip_plan` | `ItineraryResult` |
-| 11 | 📅 **Calendar** | Turns the approved plan into events and writes a real `.ics` file. | `create_calendar_event` `update_event` `export_ics` | `CalendarResult` |
+| 11 | 📅 **Calendar** | Writes the approved plan into the traveler's real Google Calendar — **tools discovered live over [MCP](#-mcp--google-calendar)**. | *from the MCP server* · falls back to `create_calendar_event` `update_event` `export_ics` | `CalendarResult` |
 
 ### 🛡 What keeps them honest
 
@@ -170,7 +170,8 @@ its contract with the model.
 | 🔦 **Tavily** | Weather, safety, visas, events, seasonal advice | 🌍 Research · 📍 Attractions |
 | 📐 **geopy** | Geodesic distance + travel-time estimates | 🏨 Lodging · 🗺 Routing |
 | 🧮 **scikit-learn** | k-means clustering of places into days | 🗺 Routing |
-| 📆 **icalendar** | `.ics` generation | 📅 Calendar |
+| 🔌 **MCP** · Google Calendar | Real calendar events, OAuth handled by the server | 📅 Calendar |
+| 📆 **icalendar** | `.ics` generation — the offline fallback | 📅 Calendar |
 
 ### 🧩 Two shared helpers
 
@@ -189,6 +190,111 @@ prompt says the same thing:
 
 An honest **"no flights found"** is a correct answer. An invented flight number
 is not.
+
+---
+
+## 🔌 MCP · Google Calendar
+
+The Calendar Agent does not contain a single line of Google API code. Instead it
+speaks **[Model Context Protocol](https://modelcontextprotocol.io)** to a
+calendar server that owns the OAuth flow and the API calls, and **discovers the
+available tools at runtime**.
+
+```
+  📅 Calendar Agent
+        │
+        │  discovers tools at runtime — never hard-codes them
+        ▼
+  ┌──────────────────────────────────────┐
+  │  🔌 MCP client (stdio)               │
+  │     langchain-mcp-adapters           │
+  └──────────────┬───────────────────────┘
+                 │ spawns via npx
+                 ▼
+  ┌──────────────────────────────────────┐
+  │  🗓 @cocal/google-calendar-mcp        │
+  │     owns OAuth · owns the API calls  │
+  └──────────────┬───────────────────────┘
+                 ▼
+          Google Calendar ✅
+```
+
+### Why this is more than a wrapper
+
+| | |
+|---|---|
+| 🔍 **Runtime discovery** | The agent asks the server what it can do. Its system prompt is **built from the tool list that comes back**, so the agent adapts to whatever server you point it at. |
+| 🔐 **Auth stays outside the app** | The MCP server owns the OAuth dance and the token refresh. No Google credentials are ever handled by agent code. |
+| 🔄 **Swappable backend** | Point `CALENDAR_MCP_ARGS` at a different server — Outlook, CalDAV, anything — and agent #11 keeps working unchanged. |
+| 🛟 **Never a hard dependency** | No server configured, Node missing, OAuth not granted? It logs the reason and falls back to `.ics`. **The planner always produces a calendar.** |
+
+### ⚙️ Setting it up
+
+Google Calendar is **opt-in**. Without it everything still works — you get a
+`.ics` file instead.
+
+**1 · Get OAuth credentials** *(one time, ~3 minutes)*
+
+1. [Google Cloud Console](https://console.cloud.google.com/) → create or pick a project
+2. Enable the **Google Calendar API**
+3. **Credentials → Create credentials → OAuth client ID → Desktop app**
+4. Download the JSON as `gcp-oauth.keys.json`
+
+**2 · Point the planner at it** — in `.env`:
+
+```ini
+CALENDAR_MCP_ENABLED=true
+GOOGLE_OAUTH_CREDENTIALS=C:/path/to/gcp-oauth.keys.json
+```
+
+**3 · Run it.** The first run opens a browser once to grant access. Requires
+[Node.js](https://nodejs.org) on `PATH` — the server is fetched by `npx`, with
+nothing to install.
+
+> 💡 Check which backend is live at any time:
+> ```bash
+> uv run python -c "from trip_planner.mcp_client import describe_calendar_backend; print(describe_calendar_backend())"
+> ```
+
+---
+
+## 🖥 The interface
+
+```bash
+uv run app.py
+```
+
+A Gradio app that **streams the graph** — you watch each of the eleven agents
+finish rather than staring at a spinner for two minutes.
+
+```
+  ┌────────────────────────────────────────────────────────────┐
+  │  ✈️  Autonomous Trip Planner                                │
+  │      eleven agents · live data · straight to your calendar │
+  ├────────────────────────────────────────────────────────────┤
+  │  Describe your trip …                      [ ✨ Plan ]      │
+  ├────────────────────────────────────────────────────────────┤
+  │  📋✓  🌍✓  ✈️✓  🏨✓  📍✓  🗺●  💰  🔍  📖  📅            │
+  │                          ↑ running                          │
+  ├────────────────────────────────────────────────────────────┤
+  │  📖 Itinerary │ ✈️ Flights │ 🏨 Stay │ 📍 Places │ 💰 …    │
+  │                                                             │
+  │  ## Day 1 — 2026-09-10: Old town                            │
+  │  • 10:00–12:00  Gulbenkian Museum  (11 min walking)         │
+  └────────────────────────────────────────────────────────────┘
+```
+
+| | |
+|---|---|
+| 🔴 **Live progress** | Eleven chips track the pipeline — idle, ⚡ running, ✓ done — updated from `graph.stream()` as each node returns |
+| 🗂 **Nine result tabs** | Itinerary · Flights · Stay · Places · Budget · Review · Calendar · Your request · Destination |
+| 🔄 **Revision aware** | Shows when the Critic sends the plan back, and which revision it is on |
+| 📎 **One-click calendar** | Download the `.ics`, or see events land in Google Calendar |
+| 🛑 **Honest failures** | An exhausted Gemini quota is explained in plain language, not a stack trace |
+| 🌗 **Light & dark** | Custom indigo→violet→pink theme that follows the system setting |
+
+Rendering lives in `render.py`, apart from the UI, so the panels are covered by
+the offline test suite.
 
 ---
 
@@ -239,15 +345,15 @@ That is the difference between a plan that reads well and a plan that works.
 
 ## 🧪 Tests
 
-**59 tests in two layers** — a fast one for every change, a live one to prove
+**69 tests in two layers** — a fast one for every change, a live one to prove
 it works against reality.
 
 ```bash
-uv run pytest tests -m "not live"   # ⚡ 51 tests · ~6s · no network, no keys
+uv run pytest tests -m "not live"   # ⚡ 61 tests · ~7s · no network, no keys
 uv run pytest tests                 # 🌐 + 8 live tests against real APIs
 ```
 
-### ⚡ Layer 1 — structure & logic · 51 tests, offline
+### ⚡ Layer 1 — structure & logic · 61 tests, offline
 
 | Suite | # | What it pins down |
 |---|:--:|---|
@@ -260,6 +366,8 @@ uv run pytest tests                 # 🌐 + 8 live tests against real APIs
 | 📋 `TestIntakeTools` · ✈️ `TestFlightTools` | 6 | Required-field logic; reproducible flight ranking |
 | 📦 `TestSchemas` · 🔀 `TestRouting` | 6 | Contracts hold; blockers separate from warnings |
 | 🏨 `TestLodgingTools` · 📖 `TestItineraryTools` | 4 | Location measurement, value ranking, Markdown rendering |
+| 🔌 `TestMcpLayer` | 6 | Server config, the async↔sync bridge, **and that a broken server falls back instead of crashing** |
+| 🖥 `TestRendering` | 4 | Every panel renders from partial state while the run is still going |
 
 No API keys required. A sample of what they actually catch:
 
@@ -298,36 +406,49 @@ Real Gemini, real Tavily, real SerpApi — asserting what cannot be faked:
 uv sync
 ```
 
-🔑 Create `.env` in the project root:
+🔑 Copy `.env.example` to `.env` and fill in three keys:
 
 ```ini
-GOOGLE_API_KEY=...      # Gemini 2.5 Flash — every agent
+GOOGLE_API_KEY=...      # Gemini 3.5 Flash — every agent
 TAVILY_API_KEY=...      # web research
 SERPAPI_API_KEY=...     # flights · hotels · places · currency
 ```
 
+> 🧠 **Switching model.** Every agent runs on `gemini-3.5-flash`. If it is
+> retired or returns 503 under load, set `GEMINI_MODEL=gemini-3.6-flash` in
+> `.env` — one line, no code change.
+
 ▶️ Plan a trip:
 
 ```bash
-uv run main.py                                    # the built-in Lisbon example
+uv run app.py                                     # 🖥 the web interface
+uv run main.py                                    # 💻 the CLI, Lisbon example
 uv run main.py "5 days in Rome, 2 people, 2500 EUR, art and food"
-uv run scripts/draw_graph.py                      # redraw the diagram
+uv run scripts/draw_graph.py                      # 🎨 redraw the diagram
 ```
 
-`main.py` prints each agent's contribution in turn, ending with the full
-Markdown itinerary and the path to the `.ics` file in `exports/` — ready for
-📆 Google Calendar, 🍎 Apple Calendar or 📧 Outlook.
+Both print or display each agent's contribution in turn, ending with the full
+itinerary and either events in your 📆 Google Calendar or a `.ics` file in
+`exports/` — ready for 🍎 Apple Calendar or 📧 Outlook too.
+
+> 📅 Want events in your real Google Calendar? See [MCP setup](#️-setting-it-up).
+> It is optional — without it you get the `.ics` file.
 
 ---
 
 ## 📁 Project layout
 
 ```
+🖥 app.py                   Gradio interface — streams the graph live
+💻 main.py                  CLI — plan a trip from the terminal
+
 src/trip_planner/
 ├── 📦 schemas.py           All Pydantic messages passed between agents
 ├── 🗃  state.py             The shared LangGraph state
-├── 🧠 llm.py               The single Gemini 2.5 Flash configuration
+├── 🧠 llm.py               The single Gemini configuration (GEMINI_MODEL)
 ├── 🕸  graph.py             Nodes, edges, the compiled app
+├── 🔌 mcp_client.py        MCP client · async bridge · graceful fallback
+├── 🎨 render.py            State → Markdown, shared by the UI and tested
 │
 ├── 🤖 agents/              One module per agent
 │   ├── 🧭 manager_agent.py       orchestrator + sequencing rules
@@ -346,9 +467,10 @@ src/trip_planner/
     ├── 🌐 serp.py                Shared SerpApi client
     └── 📐 geo.py                 Shared distance & travel-time maths
 
-🧪 tests/test_planner.py    59 tests, two layers
+🧪 tests/test_planner.py    69 tests, two layers
 🎨 scripts/draw_graph.py    Renders graph.png
 📂 exports/                 Generated .ics calendar files
+🔑 .env.example             Every setting, documented
 ```
 
 Every module carries a docstring explaining **why** it is built that way — not
@@ -358,5 +480,5 @@ the model's hands.
 ---
 
 <div align="center">
-<sub>Built with 🕸 LangGraph · 🦜 LangChain · 📦 Pydantic · 🧠 Gemini 2.5 Flash</sub>
+<sub>Built with 🕸 LangGraph · 🦜 LangChain · 📦 Pydantic · 🧠 Gemini 3.5 Flash · 🔌 MCP · 🖥 Gradio</sub>
 </div>
