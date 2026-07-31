@@ -129,17 +129,297 @@ CSS = """
 .tp-panel {
     border: 1px solid var(--tp-line);
     border-radius: 16px;
-    padding: 18px 22px;
+    padding: 20px 24px;
     background: var(--block-background-fill);
 }
-.tp-panel h4 { margin-top: 1.1em; }
-.tp-panel table { font-size: 0.9rem; }
-.tp-panel blockquote {
-    border-left: 3px solid var(--tp-accent);
-    padding-left: 14px;
-    color: var(--tp-muted);
-    margin: 14px 0;
+
+/* ---------- shared building blocks ----------
+   Colours are the validated data-viz palette: status hues for state,
+   categorical slots 1-5 for the budget breakdown. Every status also carries
+   an icon and a label, so colour never carries meaning alone. */
+.tp-panel {
+    --tp-good: #0ca30c;
+    --tp-warning: #fab219;
+    --tp-critical: #d03b3b;
+    --tp-s1: #2a78d6;  /* flights  */
+    --tp-s2: #eb6834;  /* lodging  */
+    --tp-s3: #1baf7a;  /* activities */
+    --tp-s4: #eda100;  /* food     */
+    --tp-s5: #e87ba4;  /* transport */
+    --tp-ring: rgba(11, 11, 11, 0.10);
+    --tp-soft: rgba(148, 163, 184, 0.10);
 }
+.dark .tp-panel {
+    --tp-s1: #3987e5;
+    --tp-s2: #d95926;
+    --tp-s3: #199e70;
+    --tp-s4: #c98500;
+    --tp-s5: #d55181;
+    --tp-ring: rgba(255, 255, 255, 0.10);
+    --tp-soft: rgba(148, 163, 184, 0.09);
+}
+
+.tp-series-1 { background: var(--tp-s1); }
+.tp-series-2 { background: var(--tp-s2); }
+.tp-series-3 { background: var(--tp-s3); }
+.tp-series-4 { background: var(--tp-s4); }
+.tp-series-5 { background: var(--tp-s5); }
+.tp-series-8 { background: var(--tp-muted); }
+
+.tp-dim { color: var(--tp-muted); font-weight: 400; }
+
+.tp-empty {
+    display: flex; align-items: center; gap: 10px;
+    padding: 26px; border: 1px dashed var(--tp-line); border-radius: 14px;
+    color: var(--tp-muted); font-size: 0.92rem; justify-content: center;
+}
+
+/* hero number + lede */
+.tp-hero {
+    font-size: 2.6rem; font-weight: 700; letter-spacing: -0.03em;
+    line-height: 1.1; margin: 2px 0 6px;
+}
+.tp-lede { font-size: 1.02rem; line-height: 1.6; margin-bottom: 18px; opacity: 0.9; }
+
+/* stat tiles */
+.tp-stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px; margin-bottom: 20px;
+}
+.tp-stat {
+    border: 1px solid var(--tp-line); border-radius: 14px;
+    padding: 13px 16px; background: var(--tp-soft);
+}
+.tp-stat-label {
+    font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--tp-muted); font-weight: 600;
+}
+.tp-stat-value {
+    font-size: 1.45rem; font-weight: 650; letter-spacing: -0.02em; margin-top: 3px;
+}
+.tp-stat-sub { font-size: 0.78rem; color: var(--tp-muted); margin-top: 2px; }
+
+/* sections */
+.tp-section { margin: 22px 0; }
+.tp-h3 {
+    font-size: 0.78rem !important; text-transform: uppercase; letter-spacing: 0.07em;
+    color: var(--tp-muted); font-weight: 700; margin: 0 0 12px !important;
+}
+
+/* cards */
+.tp-card {
+    border: 1px solid var(--tp-line); border-radius: 15px;
+    padding: 16px 18px; margin-bottom: 12px; background: var(--block-background-fill);
+    transition: border-color 0.2s ease, transform 0.2s ease;
+}
+.tp-card:hover { border-color: rgba(99, 102, 241, 0.45); }
+.tp-card-chosen {
+    border-color: rgba(99, 102, 241, 0.55);
+    box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.25), 0 10px 26px -18px rgba(99,102,241,0.9);
+}
+.tp-card-head {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 14px; flex-wrap: wrap;
+}
+.tp-card-title { font-weight: 650; font-size: 1.02rem; }
+.tp-card-meta { font-size: 0.83rem; color: var(--tp-muted); margin-top: 3px; }
+.tp-card-why { font-size: 0.87rem; margin-top: 8px; opacity: 0.9; }
+.tp-hours { font-size: 0.78rem; margin-top: 6px; }
+.tp-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+}
+.tp-grid .tp-card { margin-bottom: 0; }
+
+/* badges */
+.tp-badges { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
+.tp-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 10px; border-radius: 999px; font-size: 0.76rem; font-weight: 550;
+    border: 1px solid var(--tp-line); color: var(--tp-muted); white-space: nowrap;
+}
+.tp-badge-accent {
+    background: rgba(99, 102, 241, 0.13); border-color: rgba(99, 102, 241, 0.4);
+    color: #4f46e5;
+}
+.dark .tp-badge-accent { color: #a5b4fc; }
+.tp-badge-good {
+    background: rgba(12, 163, 12, 0.12); border-color: rgba(12, 163, 12, 0.4);
+    color: #0a7c0a;
+}
+.dark .tp-badge-good { color: #4ade80; }
+.tp-badge-warning {
+    background: rgba(250, 178, 25, 0.15); border-color: rgba(250, 178, 25, 0.45);
+    color: #92610a;
+}
+.dark .tp-badge-warning { color: #fbbf24; }
+.tp-badge-critical {
+    background: rgba(208, 59, 59, 0.12); border-color: rgba(208, 59, 59, 0.42);
+    color: #b3302f;
+}
+.dark .tp-badge-critical { color: #f87171; }
+.tp-badge-info { background: var(--tp-soft); }
+.tp-chips { display: flex; flex-wrap: wrap; gap: 7px; }
+
+.tp-stars { font-size: 0.82rem; color: var(--tp-s4); letter-spacing: 1px; }
+.tp-stars-num { color: var(--tp-muted); margin-left: 5px; letter-spacing: 0; }
+
+/* callouts */
+.tp-callout {
+    border-radius: 14px; padding: 14px 18px; margin: 14px 0;
+    border: 1px solid var(--tp-line); border-left-width: 3px; background: var(--tp-soft);
+}
+.tp-callout p { margin: 5px 0 0; font-size: 0.9rem; opacity: 0.9; }
+.tp-callout-title { font-weight: 650; font-size: 0.94rem; }
+.tp-callout-good { border-left-color: var(--tp-good); }
+.tp-callout-warning { border-left-color: var(--tp-warning); }
+.tp-callout-critical { border-left-color: var(--tp-critical); }
+
+/* agent reasoning */
+.tp-note {
+    display: flex; gap: 9px; margin-top: 18px; padding: 13px 16px;
+    border-radius: 12px; background: var(--tp-soft);
+    font-size: 0.88rem; color: var(--tp-muted); line-height: 1.55;
+}
+.tp-note-icon { flex-shrink: 0; }
+
+/* flights */
+.tp-price { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.025em; }
+.tp-price-sm { font-size: 1.15rem; font-weight: 650; white-space: nowrap; }
+.tp-legs { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.tp-leg { padding-left: 2px; }
+.tp-leg-route { display: flex; align-items: center; gap: 10px; }
+.tp-iata { font-weight: 700; font-size: 0.95rem; letter-spacing: 0.04em; }
+.tp-leg-line {
+    flex: 1; height: 1px; background: var(--tp-line); position: relative; max-width: 190px;
+}
+.tp-leg-plane {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    background: var(--block-background-fill); padding: 0 6px;
+    font-size: 0.8rem; color: var(--tp-accent);
+}
+.tp-leg-meta { font-size: 0.8rem; color: var(--tp-muted); margin-top: 3px; }
+.tp-tradeoffs { margin: 12px 0 0; padding-left: 2px; list-style: none; }
+.tp-tradeoffs li { font-size: 0.85rem; margin: 4px 0; opacity: 0.9; }
+
+/* budget meter + stacked breakdown */
+.tp-meter { margin: 16px 0 6px; }
+.tp-meter-track {
+    height: 12px; border-radius: 999px; overflow: hidden;
+    background: rgba(42, 120, 214, 0.16);
+}
+.tp-meter-fill { height: 100%; border-radius: 999px; transition: width 0.5s ease; }
+.tp-meter-good { background: var(--tp-good); }
+.tp-meter-critical { background: var(--tp-critical); }
+.tp-meter-scale {
+    display: flex; justify-content: space-between;
+    font-size: 0.78rem; color: var(--tp-muted); margin-top: 6px;
+}
+.tp-stack {
+    display: flex; height: 16px; border-radius: 8px; overflow: hidden;
+    gap: 2px; margin-bottom: 14px;   /* 2px surface gap between segments */
+}
+.tp-seg { height: 100%; min-width: 2px; }
+.tp-legend { display: flex; flex-direction: column; gap: 2px; }
+.tp-legend-row {
+    display: grid; grid-template-columns: 14px 1fr auto; gap: 10px;
+    align-items: center; padding: 7px 2px; border-bottom: 1px solid var(--tp-line);
+    font-size: 0.89rem;
+}
+.tp-legend-row:last-child { border-bottom: none; }
+.tp-swatch { width: 11px; height: 11px; border-radius: 3px; }
+.tp-legend-value { font-weight: 600; white-space: nowrap; }
+.tp-legend-detail {
+    grid-column: 2 / -1; font-size: 0.79rem; color: var(--tp-muted); margin-top: -2px;
+}
+
+/* itinerary timeline */
+.tp-day { padding-bottom: 8px; }
+.tp-day-head {
+    display: flex; align-items: baseline; gap: 10px;
+    flex-wrap: wrap; padding-bottom: 12px; margin-bottom: 4px;
+    border-bottom: 1px solid var(--tp-line);
+}
+.tp-day-num { font-weight: 700; font-size: 1.05rem; }
+.tp-day-date { font-size: 0.85rem; color: var(--tp-muted); }
+.tp-day-theme {
+    font-size: 0.82rem; color: var(--tp-accent); font-weight: 550;
+    margin-left: auto;
+}
+.tp-timeline { position: relative; padding-top: 6px; }
+.tp-stop {
+    display: grid; grid-template-columns: 60px 16px 1fr;
+    gap: 10px; align-items: start; padding: 7px 0;
+}
+.tp-stop-time {
+    font-size: 0.8rem; font-weight: 650; text-align: right;
+    display: flex; flex-direction: column; line-height: 1.35;
+    font-variant-numeric: tabular-nums;
+}
+.tp-stop-time .tp-dim { font-weight: 400; font-size: 0.74rem; }
+.tp-stop-dot { position: relative; height: 100%; }
+.tp-stop-dot::before {
+    content: ""; position: absolute; left: 4px; top: 5px;
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--tp-accent); box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.16);
+}
+.tp-stop-dot::after {
+    content: ""; position: absolute; left: 8px; top: 16px; bottom: -14px;
+    width: 1px; background: var(--tp-line);
+}
+.tp-stop:last-child .tp-stop-dot::after { display: none; }
+.tp-stop-name { font-weight: 600; font-size: 0.95rem; }
+.tp-travel {
+    font-size: 0.76rem; color: var(--tp-muted);
+    padding: 2px 0 2px 86px; font-style: italic;
+}
+
+/* research briefing */
+.tp-brief { display: flex; gap: 13px; align-items: flex-start; }
+.tp-brief-icon { font-size: 1.2rem; flex-shrink: 0; line-height: 1.4; }
+.tp-brief-title { font-weight: 650; font-size: 0.93rem; margin-bottom: 3px; }
+.tp-brief-body { font-size: 0.86rem; line-height: 1.55; opacity: 0.9; }
+.tp-sources { display: flex; flex-direction: column; gap: 5px; }
+.tp-source {
+    font-size: 0.84rem; text-decoration: none; color: var(--tp-accent);
+    padding: 3px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tp-source:hover { text-decoration: underline; }
+
+/* critic issues */
+.tp-issue { border-left: 3px solid var(--tp-line); }
+.tp-issue .tp-badges { margin-top: 0; }
+.tp-issue-critical { border-left-color: var(--tp-critical); }
+.tp-issue-warning { border-left-color: var(--tp-warning); }
+.tp-issue-info { border-left-color: var(--tp-s1); }
+.tp-issue-body { font-size: 0.92rem; margin-top: 9px; line-height: 1.55; }
+.tp-issue-fix {
+    font-size: 0.85rem; margin-top: 7px; color: var(--tp-muted);
+    padding: 8px 12px; border-radius: 9px; background: var(--tp-soft);
+}
+.tp-notes { margin: 0; padding-left: 20px; }
+.tp-notes li { font-size: 0.89rem; margin: 6px 0; line-height: 1.55; }
+
+/* calendar */
+.tp-backend {
+    display: flex; gap: 12px; align-items: center; margin-bottom: 18px;
+    padding: 13px 16px; border-radius: 13px;
+    border: 1px solid var(--tp-line); background: var(--tp-soft);
+}
+.tp-backend-icon { font-size: 1.3rem; }
+.tp-backend-title { font-weight: 650; font-size: 0.93rem; }
+.tp-events { display: flex; flex-direction: column; gap: 3px; }
+.tp-event {
+    display: flex; gap: 12px; align-items: flex-start; padding: 10px 4px;
+    border-bottom: 1px solid var(--tp-line);
+}
+.tp-event:last-child { border-bottom: none; }
+.tp-event-icon { font-size: 1rem; line-height: 1.35; }
+.tp-event-title { font-weight: 600; font-size: 0.92rem; }
+
+/* places */
+.tp-place .tp-badges { margin-top: 8px; }
+
 footer { display: none !important; }
 """
 
@@ -354,25 +634,27 @@ def build_ui() -> gr.Blocks:
         progress = gr.HTML(progress_html([]))
         status = gr.Markdown("", elem_id="tp-status")
 
+        # Panels are gr.HTML, not gr.Markdown: each agent's result is rendered
+        # as cards, stat tiles and meters, which Markdown cannot express.
         with gr.Tabs():
             with gr.Tab("📖 Itinerary"):
-                itinerary = gr.Markdown(elem_classes="tp-panel")
+                itinerary = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("✈️ Flights"):
-                flights = gr.Markdown(elem_classes="tp-panel")
+                flights = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("🏨 Stay"):
-                lodging = gr.Markdown(elem_classes="tp-panel")
+                lodging = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("📍 Places"):
-                places = gr.Markdown(elem_classes="tp-panel")
+                places = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("💰 Budget"):
-                budget = gr.Markdown(elem_classes="tp-panel")
+                budget = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("🔍 Review"):
-                critic = gr.Markdown(elem_classes="tp-panel")
+                critic = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("📅 Calendar"):
-                calendar = gr.Markdown(elem_classes="tp-panel")
+                calendar = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("📋 Your request"):
-                profile = gr.Markdown(elem_classes="tp-panel")
+                profile = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("🌍 Destination"):
-                research = gr.Markdown(elem_classes="tp-panel")
+                research = gr.HTML(elem_classes="tp-panel")
 
         ics_file = gr.File(label="📎 Add to your calendar (.ics)", visible=False)
 
