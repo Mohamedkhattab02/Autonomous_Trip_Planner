@@ -1,8 +1,18 @@
 """The LangGraph state shared by every agent node.
 
-Each agent node reads the fields it needs and returns a partial update.
-`completed_agents` is the only field agents append to concurrently, so it
-carries a reducer; everything else is last-write-wins.
+Each agent node reads the fields it needs and returns a partial update. Fields
+that several nodes append to concurrently carry a reducer; everything else is
+last-write-wins.
+
+Agents communicate **only** through the typed slots below — never through a
+shared conversation. An earlier version declared a `messages` field with an
+`add_messages` reducer, but no node ever wrote to it: each agent runs its own
+sub-agent with a private message list. The field was removed rather than left
+as a misleading contract.
+
+Concurrency note: `completed_agents`, `metrics` and `failed_agents` are all
+appended to by the four agents that run in parallel, so each uses `operator.add`
+to merge. Their *order* therefore reflects completion, not the pipeline order.
 """
 
 from __future__ import annotations
@@ -10,9 +20,7 @@ from __future__ import annotations
 import operator
 from typing import Annotated, TypedDict
 
-from langchain_core.messages import AnyMessage
-from langgraph.graph.message import add_messages
-
+from trip_planner.metrics import AgentMetrics
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
@@ -32,11 +40,11 @@ from trip_planner.schemas import (
 class TripState(TypedDict, total=False):
     """Shared state for the trip planning graph."""
 
-    # Conversation with the user. `add_messages` appends rather than replaces.
-    messages: Annotated[list[AnyMessage], add_messages]
-
-    # The original request, kept verbatim so agents never depend on message order.
+    # The original request, kept verbatim so agents never depend on ordering.
     user_request: str
+
+    # Anything the traveler supplied later, in answer to a clarifying question.
+    user_answer: str
 
     # Agent outputs, keyed by the agent that produced them.
     manager_decision: ManagerDecision
@@ -51,9 +59,24 @@ class TripState(TypedDict, total=False):
     itinerary: ItineraryResult
     calendar: CalendarResult
 
-    # Which agents have finished, in order. Drives the manager's routing.
+    # Which agents have finished. Appended concurrently, so unordered.
     completed_agents: Annotated[list[AgentName], operator.add]
 
-    # How many times the Critic sent the plan back for a fix. Bounds the
-    # critic -> routing -> critic loop so a stubborn plan cannot spin forever.
+    # Which agents failed, and why. A failed agent still counts as complete so
+    # the graph continues; the plan is then labelled degraded.
+    failed_agents: Annotated[list[dict], operator.add]
+
+    # Per-agent efficiency records, appended as each finishes.
+    metrics: Annotated[list[AgentMetrics], operator.add]
+
+    # Plan versioning drives the revision loop. `routing` bumps `plan_version`
+    # every time it rebuilds the days; `budget` and `critic` record which
+    # version they examined. Any stage whose recorded version is behind must
+    # run again — which is what makes the Critic re-check a revised plan
+    # instead of the plan it already rejected.
+    plan_version: int
+    budget_version: int
+    critic_version: int
+
+    # How many times the Critic sent the plan back. Bounds the revision loop.
     revision_count: int

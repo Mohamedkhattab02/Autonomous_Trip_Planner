@@ -13,6 +13,8 @@ from functools import lru_cache
 from langchain_core.tools import tool
 from tavily import TavilyClient
 
+from trip_planner.tools.cache import TTL_RESEARCH, cached
+
 # How many results each search returns. Enough for citations without
 # flooding the model's context.
 MAX_RESULTS = 4
@@ -35,6 +37,7 @@ def _client() -> TavilyClient:
     return TavilyClient()
 
 
+@cached("tavily", TTL_RESEARCH)
 def tavily_web_search(query: str) -> dict:
     """Run one Tavily search and reduce it to the fields agents use.
 

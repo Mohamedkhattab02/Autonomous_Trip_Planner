@@ -2,28 +2,32 @@
 
 Shape of the graph:
 
-    START -> manager -> intake               -> manager -> ...
-                     -> destination_research -> manager -> ...
-                     -> flights              -> manager -> ...
-                     -> lodging              -> manager -> ...
-                     -> attractions          -> manager -> ...
-                     -> routing              -> manager -> ...
-                     -> budget               -> manager -> ...
-                     -> critic               -> manager -> ...
-                     -> itinerary            -> manager -> ...
-                     -> calendar             -> manager -> ...
-                     -> END
+    START -> manager ─┬─> intake ──────────────┐
+                      │                        │
+                      ├─> destination_research ┤   these four are dispatched
+                      ├─> flights              ├─  together and run in
+                      ├─> lodging              │   parallel
+                      ├─> attractions ─────────┘
+                      │
+                      ├─> routing -> budget -> critic   (revision loop)
+                      ├─> itinerary -> calendar
+                      └─> END
 
-The manager sits at the center: every specialist returns to it, and it decides
-whether another stage should run. That is also how the revision loop works -
-when the Critic rejects the plan, the manager simply routes back to `routing`,
-so no special edge is needed.
+The manager stays at the centre, but it is now cheap: routing is decided by
+`next_required_agents()` in pure Python, and the LLM narration is opt-in. When
+that function returns several agents, the conditional edge returns a list and
+LangGraph runs them concurrently — which is what collapses Research, Flights,
+Lodging and Attractions from four sequential stages into one.
 
-Adding an agent means adding one node, one edge back to the manager, and one
-entry in the routing map - the rest of the graph is untouched.
+Every specialist node is wrapped twice: `track` records its cost, and
+`resilient_node` retries it and contains a failure so one bad stage cannot
+destroy the other ten.
 """
 
 from __future__ import annotations
+
+import os
+from pathlib import Path
 
 from langgraph.graph import END, START, StateGraph
 
@@ -38,6 +42,9 @@ from trip_planner.agents.lodging_agent import lodging_node
 from trip_planner.agents.manager_agent import manager_node, route_from_manager
 from trip_planner.agents.research_agent import research_node
 from trip_planner.agents.routing_agent import routing_node
+from trip_planner.llm import model_name
+from trip_planner.metrics import track
+from trip_planner.resilience import resilient_node
 from trip_planner.schemas import AgentName
 from trip_planner.state import TripState
 
@@ -55,72 +62,152 @@ ITINERARY = str(AgentName.ITINERARY)
 CALENDAR = str(AgentName.CALENDAR)
 
 # Every specialist, in the order plan.md lists them.
-SPECIALISTS: dict[str, callable] = {
-    INTAKE: intake_node,
-    RESEARCH: research_node,
-    FLIGHTS: flights_node,
-    LODGING: lodging_node,
-    ATTRACTIONS: attractions_node,
-    ROUTING: routing_node,
-    BUDGET: budget_node,
-    CRITIC: critic_node,
-    ITINERARY: itinerary_node,
-    CALENDAR: calendar_node,
+SPECIALISTS: dict[str, tuple] = {
+    INTAKE: (intake_node, AgentName.INTAKE),
+    RESEARCH: (research_node, AgentName.DESTINATION_RESEARCH),
+    FLIGHTS: (flights_node, AgentName.FLIGHTS),
+    LODGING: (lodging_node, AgentName.LODGING),
+    ATTRACTIONS: (attractions_node, AgentName.ATTRACTIONS),
+    ROUTING: (routing_node, AgentName.ROUTING),
+    BUDGET: (budget_node, AgentName.BUDGET),
+    CRITIC: (critic_node, AgentName.CRITIC),
+    ITINERARY: (itinerary_node, AgentName.ITINERARY),
+    CALENDAR: (calendar_node, AgentName.CALENDAR),
 }
 
-# The graph revisits `routing` on a critic revision, so the step limit has to
-# exceed 2 x (stages + manager turns). LangGraph's default of 25 is too low.
-RECURSION_LIMIT = 60
+# The graph revisits routing, budget and critic on a revision, so the step
+# limit has to exceed the longest legal path. LangGraph's default of 25 is low.
+RECURSION_LIMIT = 80
+
+# Where resumable runs are stored when checkpointing is on.
+CHECKPOINT_PATH = Path(__file__).resolve().parents[2] / ".checkpoints" / "trips.sqlite"
+
+
+def _wrap(name: str, node, agent: AgentName):
+    """Wrap a specialist node with metrics, retry and failure containment.
+
+    Args:
+        name: The node's graph name.
+        node: The raw node function, taking `(state, collector)`.
+        agent: The agent this node runs.
+
+    Returns:
+        A node function taking `(state)` alone, as LangGraph expects.
+    """
+    measured = track(name, model_name(name))(node)
+    return resilient_node(agent)(measured)
+
+
+def _manager(state: TripState) -> dict:
+    """Run the manager, measuring it like any other node.
+
+    Args:
+        state: The shared trip state.
+
+    Returns:
+        The manager's partial state update.
+    """
+    return track(MANAGER, model_name("manager"))(manager_node)(state)
 
 
 def build_graph() -> StateGraph:
     """Build the (uncompiled) trip planner graph."""
     workflow = StateGraph(TripState)
 
-    workflow.add_node(MANAGER, manager_node)
-    for name, node in SPECIALISTS.items():
-        workflow.add_node(name, node)
+    workflow.add_node(MANAGER, _manager)
+    for name, (node, agent) in SPECIALISTS.items():
+        workflow.add_node(name, _wrap(name, node, agent))
 
     workflow.add_edge(START, MANAGER)
 
-    # The manager fans out to whichever specialist it selected.
+    # The manager fans out to one specialist, or to several at once when they
+    # are independent. Returning a list from the path function is what makes
+    # LangGraph execute those branches concurrently.
     workflow.add_conditional_edges(
         MANAGER,
         route_from_manager,
         {**{name: name for name in SPECIALISTS}, "finish": END},
     )
 
-    # Every specialist reports back to the manager for the next decision.
+    # Every specialist reports back to the manager for the next decision. When
+    # a parallel group runs, the manager resumes once the whole group is done.
     for name in SPECIALISTS:
         workflow.add_edge(name, MANAGER)
 
     return workflow
 
 
-def compile_graph():
-    """Build and compile the graph into a runnable app."""
-    return build_graph().compile()
+def checkpointing_enabled() -> bool:
+    """Report whether runs are persisted and can be resumed.
+
+    Returns:
+        True unless `TRIP_CHECKPOINTS` is explicitly switched off.
+    """
+    return os.getenv("TRIP_CHECKPOINTS", "true").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
 
 
-# Module-level app, so `langgraph dev` and scripts share one instance.
+def compile_graph(checkpointer=None):
+    """Build and compile the graph into a runnable app.
+
+    Args:
+        checkpointer: A LangGraph checkpointer, or None for an in-memory run.
+
+    Returns:
+        The compiled app.
+    """
+    return build_graph().compile(checkpointer=checkpointer)
+
+
+# Module-level app, so `langgraph dev` and scripts share one instance. It is
+# compiled without a checkpointer; `plan_trip` supplies one per run, because a
+# SQLite connection cannot be shared safely across threads.
 app = compile_graph()
 
 
-def plan_trip(user_request: str) -> TripState:
-    """Run the planner end to end on a user's request.
+def initial_state(user_request: str) -> dict:
+    """Build the starting state for a plan.
 
     Args:
         user_request: The traveler's free-text request.
 
     Returns:
+        The initial `TripState` values.
+    """
+    return {
+        "user_request": user_request,
+        "completed_agents": [],
+        "failed_agents": [],
+        "metrics": [],
+        "plan_version": 0,
+        "budget_version": 0,
+        "critic_version": 0,
+        "revision_count": 0,
+    }
+
+
+def plan_trip(user_request: str, thread_id: str | None = None) -> TripState:
+    """Run the planner end to end on a user's request.
+
+    Args:
+        user_request: The traveler's free-text request.
+        thread_id: Resume an earlier run instead of starting a new one. Needs
+            checkpointing to be enabled.
+
+    Returns:
         The final state, holding every agent's structured output.
     """
-    return app.invoke(
-        {
-            "user_request": user_request,
-            "messages": [{"role": "user", "content": user_request}],
-            "completed_agents": [],
-            "revision_count": 0,
-        },
-        config={"recursion_limit": RECURSION_LIMIT},
-    )
+    config: dict = {"recursion_limit": RECURSION_LIMIT}
+
+    if thread_id and checkpointing_enabled():
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        config["configurable"] = {"thread_id": thread_id}
+        with SqliteSaver.from_conn_string(str(CHECKPOINT_PATH)) as saver:
+            return compile_graph(saver).invoke(initial_state(user_request), config)
+
+    return app.invoke(initial_state(user_request), config)

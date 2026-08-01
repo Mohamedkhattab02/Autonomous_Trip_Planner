@@ -10,9 +10,7 @@ the graph returns here with the issues attached.
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
-
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
@@ -38,11 +36,12 @@ Follow these steps:
 2. Assign each cluster to a date. Before fixing a day, call
    `check_opening_hours` for each place in it - if a place is closed that day,
    swap it with a place from another day.
-3. Order the stops within a day geographically. Use `calculate_distance`
-   between consecutive stops and `calculate_travel_time` to get the gap,
-   and put the result in `travel_minutes_from_previous` and `travel_mode`.
-4. Assign start and end times using each place's visit duration plus the
-   travel time to reach it.
+3. For each day, call `schedule_day` with that day's places and its date. It
+   orders them under their real opening hours, computes the travel gap
+   between consecutive stops, and returns feasible start and end times.
+   Copy its `stops` through unchanged - do not re-time them yourself.
+4. Anything `schedule_day` returns in `unscheduled` did not fit. Try it on
+   another day; if it still does not fit, list it in `unscheduled_place_ids`.
 
 Rules:
 - The day runs from {day_start} to {day_end}. Never schedule outside it.
@@ -62,8 +61,8 @@ Rules:
 
 def build_routing_agent():
     """Build the Routing Agent runnable."""
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="routing",
         tools=ROUTING_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         response_format=RoutingResult,
@@ -153,14 +152,16 @@ def _routing_brief(
     )
 
 
-def routing_node(state: TripState) -> dict:
+def routing_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Routing Agent.
 
-    On a revision the Critic's issues are passed in, and the previous critic
-    verdict is cleared so the next critic pass judges the new plan.
+    Every run bumps `plan_version`. Budget and Critic record the version they
+    examined, so bumping it here is what forces both of them to run again on
+    the rebuilt plan — instead of the plan the Critic already rejected.
 
     Args:
         state: The shared trip state; reads `intake`, `attractions`, `critic`.
+        collector: Optional metrics callback.
 
     Returns:
         A partial state update with the day-by-day plan.
@@ -177,6 +178,9 @@ def routing_node(state: TripState) -> dict:
     )
 
     agent = build_routing_agent()
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = agent.invoke(
         {
             "messages": [
@@ -189,7 +193,11 @@ def routing_node(state: TripState) -> dict:
     )
     routing: RoutingResult = result["structured_response"]
 
-    update: dict = {"routing": routing}
+    # A new set of days is a new plan version: Budget and Critic are now stale.
+    update: dict = {
+        "routing": routing,
+        "plan_version": state.get("plan_version", 0) + 1,
+    }
     if is_revision:
         # Count the revision; the manager uses it to stop an endless retry loop.
         update["revision_count"] = state.get("revision_count", 0) + 1

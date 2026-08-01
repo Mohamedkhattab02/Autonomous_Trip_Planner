@@ -311,3 +311,55 @@ def validate_budget(
 
 
 CRITIC_TOOLS = [verify_place, verify_opening_hours, validate_schedule, validate_budget]
+
+
+@tool
+def verify_places(place_names: list[str], destination: str) -> dict:
+    """Check that several places exist, in parallel.
+
+    Prefer this over calling `verify_place` repeatedly: the lookups run
+    concurrently, so checking a whole itinerary costs roughly one lookup's
+    worth of time.
+
+    Args:
+        place_names: The names as they appear in the plan.
+        destination: The city they are supposed to be in.
+
+    Returns:
+        A dict with `results` (one entry per name) and `missing` — the names
+        that could not be found anywhere, which are the real problems.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not place_names:
+        return {"results": [], "missing": []}
+
+    def check(name: str) -> dict:
+        response = serp_search(
+            engine="google_maps", q=f"{name} {destination}", type="search", hl="en"
+        )
+        if "error" in response:
+            return {"name": name, "exists": None, "error": response["error"]}
+        results = response.get("local_results") or []
+        record = results[0] if results else response.get("place_results")
+        if not record:
+            return {"name": name, "exists": False}
+        return {
+            "name": name,
+            "exists": True,
+            "found_as": record.get("title", ""),
+            "address": record.get("address", ""),
+            "permanently_closed": "permanently closed"
+            in str(record.get("open_state", "")).lower(),
+        }
+
+    with ThreadPoolExecutor(max_workers=min(len(place_names), 8)) as pool:
+        results = list(pool.map(check, place_names))
+
+    return {
+        "results": results,
+        "missing": [r["name"] for r in results if r.get("exists") is False],
+    }
+
+
+CRITIC_TOOLS.append(verify_places)

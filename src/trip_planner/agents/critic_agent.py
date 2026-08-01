@@ -8,9 +8,7 @@ Agent for a revision.
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
-
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
@@ -32,8 +30,9 @@ Follow these steps:
 1. Call `validate_schedule` with the whole day plan. It finds overlaps, stops
    that start before travel could finish, and times outside the day.
 2. Call `validate_budget` with the total and the traveler's budget.
-3. Call `verify_place` on any place whose name looks generic or invented, to
-   confirm it exists and is not permanently closed.
+3. Call `verify_places` ONCE with every place name in the plan. It checks
+   them in parallel and returns a `missing` list — those are the real
+   problems. Use `verify_place` only to dig into a single suspicious result.
 4. Call `verify_opening_hours` for places on days where being closed would
    wreck that day, especially museums, which usually close one weekday.
 5. Check every stated traveler constraint against the plan yourself.
@@ -55,8 +54,8 @@ Rules:
 
 def build_critic_agent():
     """Build the Critic Agent runnable."""
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="critic",
         tools=CRITIC_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         response_format=CriticResult,
@@ -154,7 +153,7 @@ def _critic_brief(
     )
 
 
-def critic_node(state: TripState) -> dict:
+def critic_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Critic Agent.
 
     Args:
@@ -168,6 +167,9 @@ def critic_node(state: TripState) -> dict:
     """
     profile = state["intake"].profile
     agent = build_critic_agent()
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = agent.invoke(
         {
             "messages": [
@@ -185,7 +187,12 @@ def critic_node(state: TripState) -> dict:
     )
     critic: CriticResult = result["structured_response"]
 
-    update: dict = {"critic": critic}
+    update: dict = {
+        "critic": critic,
+        # Record which plan this verdict judged. The manager re-runs the Critic
+        # whenever Routing has produced a newer version.
+        "critic_version": state.get("plan_version", 0),
+    }
     if AgentName.CRITIC not in state.get("completed_agents", []):
         update["completed_agents"] = [AgentName.CRITIC]
 

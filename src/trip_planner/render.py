@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from html import escape
 
+from trip_planner.export import maps_link
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
@@ -505,7 +506,14 @@ def render_lodging(lodging: LodgingResult | None) -> str:
             f'<div class="tp-price-sm">{_esc(_money(option.total_price, option.currency))}'
             f'<span class="tp-dim"> total</span></div></div>'
             f'<div class="tp-badges">{"".join(badges)}{_stars(option.rating)}</div>'
-            f"{tradeoffs}</div>"
+            f"{tradeoffs}"
+            + (
+                f'<a class="tp-book" href="{_esc(option.booking_url)}" target="_blank" '
+                f'rel="noopener noreferrer">🔗 Book this stay</a>'
+                if option.booking_url
+                else ""
+            )
+            + "</div>"
         )
 
     parts.append(_note(lodging.reasoning))
@@ -574,6 +582,12 @@ def render_places(attractions: AttractionsResult | None) -> str:
             + (
                 f'<div class="tp-dim tp-hours">🕐 {_esc(place.opening_hours)}</div>'
                 if place.opening_hours and place.opening_hours != "unknown"
+                else ""
+            )
+            + (
+                f'<a class="tp-book" href="{_esc(maps_link(place))}" target="_blank" '
+                f'rel="noopener noreferrer">📍 Open in Maps</a>'
+                if place.coordinates
                 else ""
             )
             + "</div>"
@@ -960,3 +974,95 @@ def render_calendar(calendar: CalendarResult | None, backend: str) -> str:
 
     parts.append(_note(calendar.reasoning))
     return "".join(parts)
+
+
+# --------------------------------------------------------------------------
+# ⚡ Efficiency
+# --------------------------------------------------------------------------
+
+
+def render_efficiency(metrics: list, wall_seconds: float = 0.0, backend: str = "") -> str:
+    """Render what the run cost in time, tokens and money.
+
+    Args:
+        metrics: The per-agent `AgentMetrics` records.
+        wall_seconds: Measured wall-clock time for the whole run.
+        backend: Description of the model configuration.
+
+    Returns:
+        An HTML panel.
+    """
+    if not metrics:
+        return _empty("Efficiency figures appear once the run starts.")
+
+    from trip_planner.metrics import summarize
+
+    summary = summarize(list(metrics), wall_seconds=wall_seconds)
+    slowest = max((record.seconds for record in summary.agents), default=1) or 1
+
+    bars = []
+    for record in summary.agents:
+        share = record.seconds / slowest * 100
+        tokens = f"{record.total_tokens:,} tok" if record.total_tokens else "—"
+        cost = f"${record.cost_usd:.4f}" if record.cost_usd is not None else "—"
+        state = "critical" if record.failed else "1"
+        bars.append(
+            f'<div class="tp-bar-row">'
+            f'<span class="tp-bar-label">{_esc(record.agent)}</span>'
+            f'<span class="tp-bar-track"><span class="tp-bar-fill '
+            f'{"tp-bar-failed" if record.failed else f"tp-series-{state}"}" '
+            f'style="width:{share:.2f}%"></span></span>'
+            f'<span class="tp-bar-value">{record.seconds:.1f}s</span>'
+            f'<div class="tp-bar-meta">{record.llm_calls} LLM · '
+            f"{record.tool_calls} tools · {tokens} · {cost}</div></div>"
+        )
+
+    parts = [
+        _stats(
+            [
+                ("Wall clock", f"{summary.wall_seconds:.0f}s", "what you waited"),
+                (
+                    "Saved by parallelism",
+                    f"{summary.parallel_saving:.0f}s",
+                    "agents run concurrently",
+                ),
+                ("LLM calls", str(summary.llm_calls), "across every agent"),
+                (
+                    "Cost",
+                    f"${summary.cost_usd:.4f}" if summary.cost_usd is not None else "—",
+                    "this plan",
+                ),
+            ]
+        ),
+    ]
+    if backend:
+        parts.append(f'<div class="tp-lede">Model: <code>{_esc(backend)}</code></div>')
+    parts.append(
+        _section("Time per agent (slowest first)", f'<div class="tp-bars">{"".join(bars)}</div>')
+    )
+    return "".join(parts)
+
+
+def render_degraded(failed: list) -> str:
+    """Render a banner naming any stage that failed.
+
+    A degraded plan must be labelled as degraded rather than presented whole.
+
+    Args:
+        failed: Entries from `failed_agents`.
+
+    Returns:
+        An HTML fragment, or an empty string when nothing failed.
+    """
+    if not failed:
+        return ""
+    rows = "".join(
+        f"<li><b>{_esc(entry.get('agent', '?'))}</b>: {_esc(entry.get('error', ''))}</li>"
+        for entry in failed
+    )
+    return (
+        '<div class="tp-callout tp-callout-critical">'
+        '<div class="tp-callout-title">⚠️ This plan is incomplete</div>'
+        f"<p>{len(failed)} stage(s) failed, so parts of the trip are missing:</p>"
+        f'<ul class="tp-notes">{rows}</ul></div>'
+    )

@@ -212,3 +212,60 @@ def web_search(query: str) -> dict:
 
 
 ATTRACTION_TOOLS = [web_search, search_places, get_opening_hours, get_place_details]
+
+
+@tool
+def search_places_bulk(queries: list[str], destination: str) -> dict:
+    """Search several place categories at once, in parallel.
+
+    Prefer this over calling `search_places` repeatedly: the lookups run
+    concurrently, so four interests cost roughly one search's worth of time
+    instead of four.
+
+    Args:
+        queries: What to look for, one entry per interest, e.g.
+            ["art museums", "seafood restaurants", "viewpoints"].
+        destination: Where to look, e.g. "Lisbon, Portugal".
+
+    Returns:
+        A dict with `places` (deduplicated across every query, each tagged with
+        the `matched_query` that found it) and `queries_run`.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not queries:
+        return {"places": [], "queries_run": 0}
+
+    def run(query: str) -> tuple[str, dict]:
+        response = serp_search(
+            engine="google_maps", q=f"{query} in {destination}", type="search", hl="en"
+        )
+        return query, response
+
+    with ThreadPoolExecutor(max_workers=min(len(queries), 6)) as pool:
+        responses = list(pool.map(run, queries))
+
+    places: list[dict] = []
+    seen: set[str] = set()
+    index = 1
+    for query, response in responses:
+        for result in (response.get("local_results") or [])[:MAX_PLACES]:
+            key = result.get("place_id") or result.get("title", "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            place = _summarize_place(index, result)
+            place["matched_query"] = query
+            places.append(place)
+            index += 1
+
+    if not places:
+        return {
+            "error": f"No places found for any of {queries} in {destination}.",
+            "places": [],
+            "queries_run": len(queries),
+        }
+    return {"places": places, "queries_run": len(queries)}
+
+
+ATTRACTION_TOOLS.append(search_places_bulk)

@@ -4,7 +4,7 @@
 
 **Eleven specialist agents that plan a real trip — from one sentence to your Google Calendar.**
 
-`LangGraph` · `Gemini 3.5 Flash` · `Pydantic` · `MCP` · `Gradio` · grounded in live travel data
+`LangGraph` · `GPT-5 mini` · `Pydantic` · `MCP` · `Gradio` · parallel agents · grounded in live travel data
 
 [🏗 Architecture](#-architecture) · [🤖 Agents](#-the-eleven-agents) · [🧰 Tools](#-the-tool-layer) · [🔌 MCP](#-mcp--google-calendar) · [🖥 Interface](#-the-interface) · [🎯 Principles](#-two-design-principles) · [🧪 Tests](#-tests) · [🚀 Start](#-quick-start)
 
@@ -56,23 +56,28 @@ a typed result.
 ### The order — a pipeline with one loop back
 
 Each stage consumes the previous one's output, so the sequence is fixed in
-code. The Critic is a real gate: a blocker sends the plan back to be rebuilt.
+code — and where stages *don't* depend on each other, they run concurrently.
+The Critic is a real gate: a blocker sends the plan back to be rebuilt.
 
 ```
  START
    │
    ▼
- 📋 Intake ─▶ 🌍 Research ─▶ ✈️ Flights ─▶ 🏨 Lodging ─▶ 📍 Attractions
-                                                              │
-   ┌──────────────────────────────────────────────────────────┘
-   ▼
+ 📋 Intake
+   │
+   ├──────────┬──────────┬──────────┐   ⚡ all four depend only on the
+   ▼          ▼          ▼          ▼      profile, so they run at once
+ 🌍 Research ✈️ Flights 🏨 Lodging 📍 Attractions
+   └──────────┴──────────┴──────────┘
+                   │  (join — waits for all four)
+                   ▼
  🗺 Routing ─▶ 💰 Budget ─▶ 🔍 Critic ──── approved? ──── ✅ ──▶ 📖 Itinerary
    ▲                            │                                    │
    └────────── ❌ blocker ──────┘                                    ▼
-        (issues attached, max 2 revisions)                     📅 Calendar
-                                                                    │
-                                                                    ▼
-                                                                   END
+     the whole loop re-runs: routing → budget → critic,        📅 Calendar
+     so a revised plan is always re-costed and re-reviewed           │
+     (capped at 2 revisions)                                         ▼
+                                                                    END
 ```
 
 <div align="center">
@@ -109,6 +114,9 @@ class TripState(TypedDict, total=False):
     flights: FlightsResult                               # ✈️ agent 4
     ...                                                  #    one slot each
     completed_agents: Annotated[list[AgentName], operator.add]
+    metrics: Annotated[list[AgentMetrics], operator.add] # ⚡ what each cost
+    failed_agents: Annotated[list[dict], operator.add]   # 🛟 degraded, not dead
+    plan_version: int                                    # 🔁 drives re-checks
     revision_count: int                                  # bounds the loop
 ```
 
@@ -127,10 +135,10 @@ boundary** instead of surfacing three stages later as a mystery.
 | 3 | 🌍 **Destination Research** | Weather, safety, currency, transport, entry rules — every claim cited. | `tavily_search` `get_weather` `get_entry_requirements` `get_currency_info` | `DestinationResearch` |
 | 4 | ✈️ **Flights** | Searches live fares, ranks them, recommends one with honest trade-offs. | `search_flights` `compare_flights` `get_flight_details` | `FlightsResult` |
 | 5 | 🏨 **Lodging** | Finds real stays and *measures* whether "central" is actually true. | `search_hotels` `get_hotel_details` `check_hotel_location` `compare_hotels` | `LodgingResult` |
-| 6 | 📍 **Attractions** | Builds the pool of candidate places, with real opening hours and closing days. | `web_search` `search_places` `get_opening_hours` `get_place_details` | `AttractionsResult` |
-| 7 | 🗺 **Routing** | Clusters places into days you can walk, and times each stop. Fixes what the Critic rejects. | `calculate_distance` `calculate_travel_time` `cluster_locations` `check_opening_hours` | `RoutingResult` |
+| 6 | 📍 **Attractions** | Builds the pool of candidate places, with real opening hours and closing days. | `search_places_bulk` ⚡ `web_search` `search_places` `get_opening_hours` `get_place_details` | `AttractionsResult` |
+| 7 | 🗺 **Routing** | Clusters places into days you can walk, then times each stop under its real opening hours. Fixes what the Critic rejects. | `schedule_day` `cluster_locations` `calculate_distance` `calculate_travel_time` `check_opening_hours` | `RoutingResult` |
 | 8 | 💰 **Budget** | Totals every category, converts currencies, proposes cuts when over. | `calculate_total_cost` `convert_currency` `estimate_food_cost` `estimate_local_transport_cost` `suggest_cheaper_alternatives` | `BudgetResult` |
-| 9 | 🔍 **Critic** | The gate. Verifies the plan is real, possible and within limits. | `verify_place` `verify_opening_hours` `validate_schedule` `validate_budget` | `CriticResult` |
+| 9 | 🔍 **Critic** | The gate. Verifies the plan is real, possible and within limits — and re-checks every revision. | `verify_places` ⚡ `verify_place` `verify_opening_hours` `validate_schedule` `validate_budget` | `CriticResult` |
 | 10 | 📖 **Itinerary** | Merges everything into the one document a person actually reads. | `read_agent_results` `build_daily_itinerary` `format_trip_plan` | `ItineraryResult` |
 | 11 | 📅 **Calendar** | Writes the approved plan into the traveler's real Google Calendar — **tools discovered live over [MCP](#-mcp--google-calendar)**. | *from the MCP server* · falls back to `create_calendar_event` `update_event` `export_ics` | `CalendarResult` |
 
@@ -190,6 +198,26 @@ prompt says the same thing:
 
 An honest **"no flights found"** is a correct answer. An invented flight number
 is not.
+
+---
+
+## ⚡ Efficiency & reliability
+
+Measured work from [TODOLIST.md](TODOLIST.md), which records the baseline each
+change was made against.
+
+| | What it does |
+|---|---|
+| **Parallel agents** | Research, Flights, Lodging and Attractions depend only on the profile, so they are dispatched together. The critical path drops from 10 sequential stages to 7; a prototype of the same shape measured **2.82× faster**. |
+| **LLM-free routing** | The manager ran 13× per plan, each a full agent loop — ~30 model round trips to narrate a decision `next_required_agents()` already computed. Now templated by default; `EXPLAIN_ROUTING=true` restores the LLM version. |
+| **Re-checked revisions** | `plan_version` forces Budget and Critic to re-run whenever Routing rebuilds the days. Previously routing ran 3× in a row and the Critic never re-checked its own rejection. |
+| **Retry & backoff** | 503 gets a short retry, 429 a long one, a bad request none at all — instead of one transient error destroying the whole run. |
+| **Degrade, don't die** | A failed stage is recorded in `failed_agents` and the plan continues; the UI labels it incomplete rather than presenting it as whole. |
+| **Tool cache** | Searches are cached on disk — prices for hours, places for days. Repeat runs are near-instant and free. |
+| **Time-window scheduling** | `schedule_day` orders each day by real opening hours and travel gaps, instead of asking the model to eyeball it. |
+| **Measured, not guessed** | `metrics.py` records per-agent time, tokens and cost. See it in the **⚡ Efficiency** tab, or `uv run scripts/benchmark.py`. |
+| **Resume & ask** | SQLite checkpointing means a failed plan resumes instead of replanning; with `TRIP_ASK_USER=true` the graph pauses on a missing detail and continues from the answer. |
+| **Remembers you** | Home city, currency and standing constraints persist between trips — filled in underneath the request, never over it. |
 
 ---
 
@@ -345,15 +373,15 @@ That is the difference between a plan that reads well and a plan that works.
 
 ## 🧪 Tests
 
-**69 tests in two layers** — a fast one for every change, a live one to prove
+**113 tests in two layers** — a fast one for every change, a live one to prove
 it works against reality.
 
 ```bash
-uv run pytest tests -m "not live"   # ⚡ 61 tests · ~7s · no network, no keys
+uv run pytest tests -m "not live"   # ⚡ 105 tests · ~6s · no network, no keys
 uv run pytest tests                 # 🌐 + 8 live tests against real APIs
 ```
 
-### ⚡ Layer 1 — structure & logic · 61 tests, offline
+### ⚡ Layer 1 — structure & logic · 105 tests, offline
 
 | Suite | # | What it pins down |
 |---|:--:|---|
@@ -409,14 +437,16 @@ uv sync
 🔑 Copy `.env.example` to `.env` and fill in three keys:
 
 ```ini
-GOOGLE_API_KEY=...      # Gemini 3.5 Flash — every agent
-TAVILY_API_KEY=...      # web research
-SERPAPI_API_KEY=...     # flights · hotels · places · currency
+LLM_MODEL=openai:gpt-5-mini   # every agent; any provider:model works
+OPENAI_API_KEY=...            # the provider your model needs
+TAVILY_API_KEY=...            # web research
+SERPAPI_API_KEY=...           # flights · hotels · places · currency
 ```
 
-> 🧠 **Switching model.** Every agent runs on `gemini-3.5-flash`. If it is
-> retired or returns 503 under load, set `GEMINI_MODEL=gemini-3.6-flash` in
-> `.env` — one line, no code change.
+> 🧠 **Switching model.** One line in `.env` repoints every agent —
+> `LLM_MODEL=google_genai:gemini-3.6-flash`, `anthropic:…`, `ollama:…`. Per-agent
+> overrides (`LLM_MODEL_CRITIC=openai:gpt-5`) let cheap formatting work run on a
+> small model while the reasoning-heavy agents keep the strong one.
 
 ▶️ Plan a trip:
 
@@ -424,7 +454,10 @@ SERPAPI_API_KEY=...     # flights · hotels · places · currency
 uv run app.py                                     # 🖥 the web interface
 uv run main.py                                    # 💻 the CLI, Lisbon example
 uv run main.py "5 days in Rome, 2 people, 2500 EUR, art and food"
+uv run scripts/benchmark.py                       # ⚡ measure time · tokens · cost
+uv run scripts/clear_cache.py                     # 🧹 empty the tool cache
 uv run scripts/draw_graph.py                      # 🎨 redraw the diagram
+docker compose up                                 # 🐳 containerised
 ```
 
 Both print or display each agent's contribution in turn, ending with the full
@@ -445,7 +478,11 @@ itinerary and either events in your 📆 Google Calendar or a `.ics` file in
 src/trip_planner/
 ├── 📦 schemas.py           All Pydantic messages passed between agents
 ├── 🗃  state.py             The shared LangGraph state
-├── 🧠 llm.py               The single Gemini configuration (GEMINI_MODEL)
+├── 🧠 llm.py               Model config · tiering · retry (LLM_MODEL)
+├── ⚡ metrics.py           Per-agent time, tokens and cost
+├── 🛟 resilience.py        Retry, backoff and failure containment
+├── 🧳 memory.py            Traveler preferences between trips
+├── 📤 export.py            PDF, booking links, map directions
 ├── 🕸  graph.py             Nodes, edges, the compiled app
 ├── 🔌 mcp_client.py        MCP client · async bridge · graceful fallback
 ├── 🎨 render.py            State → Markdown, shared by the UI and tested
@@ -480,5 +517,5 @@ the model's hands.
 ---
 
 <div align="center">
-<sub>Built with 🕸 LangGraph · 🦜 LangChain · 📦 Pydantic · 🧠 Gemini 3.5 Flash · 🔌 MCP · 🖥 Gradio</sub>
+<sub>Built with 🕸 LangGraph · 🦜 LangChain · 📦 Pydantic · 🧠 GPT-5 mini · 🔌 MCP · 🖥 Gradio</sub>
 </div>

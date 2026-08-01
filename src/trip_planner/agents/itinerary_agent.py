@@ -7,9 +7,7 @@ and the practical notes.
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
-
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
 from trip_planner.schemas import AgentName, ItineraryResult, TravelerProfile
 from trip_planner.state import TripState
 from trip_planner.tools import ITINERARY_TOOLS, make_read_agent_results
@@ -52,8 +50,8 @@ def build_itinerary_agent(state: TripState):
     Returns:
         The agent runnable, with `read_agent_results` bound to `state`.
     """
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="itinerary",
         tools=[make_read_agent_results(state), *ITINERARY_TOOLS],
         system_prompt=SYSTEM_PROMPT,
         response_format=ItineraryResult,
@@ -83,7 +81,7 @@ def _itinerary_brief(profile: TravelerProfile, days: int) -> str:
     )
 
 
-def itinerary_node(state: TripState) -> dict:
+def itinerary_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Itinerary Agent.
 
     Args:
@@ -100,6 +98,9 @@ def itinerary_node(state: TripState) -> dict:
     )
 
     agent = build_itinerary_agent(state)
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = agent.invoke(
         {"messages": [{"role": "user", "content": _itinerary_brief(profile, days)}]}
     )

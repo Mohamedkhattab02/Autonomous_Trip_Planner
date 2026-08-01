@@ -7,9 +7,7 @@ concrete cuts when it does not.
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
-
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
@@ -53,8 +51,8 @@ Rules:
 
 def build_budget_agent():
     """Build the Budget Agent runnable."""
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="budget",
         tools=BUDGET_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         response_format=BudgetResult,
@@ -175,7 +173,7 @@ def _budget_brief(
     )
 
 
-def budget_node(state: TripState) -> dict:
+def budget_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Budget Agent.
 
     Args:
@@ -193,6 +191,9 @@ def budget_node(state: TripState) -> dict:
     )
 
     agent = build_budget_agent()
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = agent.invoke(
         {
             "messages": [
@@ -212,7 +213,13 @@ def budget_node(state: TripState) -> dict:
     )
     budget: BudgetResult = result["structured_response"]
 
-    return {
+    update: dict = {
         "budget": budget,
-        "completed_agents": [AgentName.BUDGET],
+        # Record which plan these costs belong to, so a later revision forces
+        # a recount instead of shipping figures for a plan that no longer exists.
+        "budget_version": state.get("plan_version", 0),
     }
+    if AgentName.BUDGET not in state.get("completed_agents", []):
+        update["completed_agents"] = [AgentName.BUDGET]
+
+    return update

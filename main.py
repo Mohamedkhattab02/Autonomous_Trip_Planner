@@ -8,8 +8,12 @@ Usage:
 from __future__ import annotations
 
 import sys
+import time
 
+from trip_planner.export import to_pdf
 from trip_planner.graph import plan_trip
+from trip_planner.llm import describe_models
+from trip_planner.metrics import summarize
 from trip_planner.state import TripState
 
 DEFAULT_REQUEST = (
@@ -188,12 +192,57 @@ def _print_calendar(state: TripState) -> None:
         print(f"\nCalendar file: {calendar.ics_path}")
 
 
+def _print_efficiency(state: TripState, wall: float) -> None:
+    """Print what the run cost in time, calls and money.
+
+    Args:
+        state: The final trip state.
+        wall: Measured wall-clock seconds for the whole run.
+    """
+    records = state.get("metrics", [])
+    if not records:
+        return
+
+    summary = summarize(records, wall_seconds=wall)
+    _heading("EFFICIENCY")
+    print(f"{'agent':<24}{'secs':>8}{'llm':>6}{'tools':>7}{'tokens':>10}{'cost':>10}")
+    print("-" * 65)
+    for record in summary.agents:
+        cost = f"${record.cost_usd:.4f}" if record.cost_usd is not None else "-"
+        flag = "  FAILED" if record.failed else ""
+        print(
+            f"{record.agent:<24}{record.seconds:>8.1f}{record.llm_calls:>6}"
+            f"{record.tool_calls:>7}{record.total_tokens:>10,}{cost:>10}{flag}"
+        )
+    print("-" * 65)
+    total = f"${summary.cost_usd:.4f}" if summary.cost_usd is not None else "-"
+    print(
+        f"{'TOTAL':<24}{summary.seconds:>8.1f}{summary.llm_calls:>6}"
+        f"{summary.tool_calls:>7}"
+        f"{summary.input_tokens + summary.output_tokens:>10,}{total:>10}"
+    )
+    print(
+        f"\nWall clock: {summary.wall_seconds:.1f}s "
+        f"(parallelism saved {summary.parallel_saving:.1f}s)"
+    )
+
+    failed = state.get("failed_agents", [])
+    if failed:
+        print(f"\nDEGRADED - {len(failed)} stage(s) failed:")
+        for entry in failed:
+            print(f"  - {entry['agent']}: {entry['error'][:150]}")
+
+
 def main() -> None:
     """Plan a trip and print the result of each agent."""
     request = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_REQUEST
 
+    print(f"Model:   {describe_models()}")
     print(f"Request: {request}")
+
+    started = time.perf_counter()
     final = plan_trip(request)
+    wall = time.perf_counter() - started
 
     completed = ", ".join(str(name) for name in final.get("completed_agents", []))
     print(f"\nAgents that ran: {completed or 'none'}")
@@ -210,6 +259,12 @@ def main() -> None:
     _print_critic(final)
     _print_itinerary(final)
     _print_calendar(final)
+
+    _print_efficiency(final, wall)
+
+    itinerary = final.get("itinerary")
+    if itinerary and itinerary.days:
+        print(f"\nPDF: {to_pdf(itinerary)}")
 
     decision = final.get("manager_decision")
     if decision:

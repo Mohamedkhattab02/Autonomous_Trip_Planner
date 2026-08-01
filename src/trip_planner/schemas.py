@@ -44,6 +44,13 @@ class ManagerDecision(BaseModel):
             "complete and the trip plan can be finalized."
         ),
     )
+    next_agents: list[AgentName] = Field(
+        default_factory=list,
+        description=(
+            "Every agent to dispatch now. Holds more than one when the agents "
+            "are independent and can run concurrently."
+        ),
+    )
     reasoning: str = Field(
         description="Short explanation of why this agent was chosen, or why the work is done."
     )
@@ -218,6 +225,10 @@ class LodgingOption(BaseModel):
         default=None, ge=0, le=5, description="Guest rating out of 5."
     )
     stars: int | None = Field(default=None, ge=0, le=5, description="Hotel class.")
+    booking_url: str = Field(
+        default="",
+        description="Link to book or view this stay, exactly as the search returned it.",
+    )
     pros: list[str] = Field(default_factory=list, description="Why this option is good.")
     cons: list[str] = Field(default_factory=list, description="Drawbacks to weigh.")
 
@@ -273,6 +284,11 @@ class Place(BaseModel):
         default="", description="How it matches the traveler's interests."
     )
     source_url: str = Field(default="", description="Where this information came from.")
+    website: str = Field(default="", description="The place's own website, when it has one.")
+    maps_url: str = Field(
+        default="",
+        description="Google Maps link for this place, built from its coordinates.",
+    )
 
 
 class AttractionsResult(BaseModel):
@@ -462,3 +478,44 @@ class CalendarResult(BaseModel):
         default=None, description="Path of the written .ics file, when one was created."
     )
     reasoning: str = Field(description="What was exported and anything skipped.")
+
+
+# --------------------------------------------------------------------------
+# Traveler memory (persists between trips)
+# --------------------------------------------------------------------------
+
+
+class TravelerPreferences(BaseModel):
+    """Stable facts about a traveler, reused across trips.
+
+    These are defaults only. Anything the current request states explicitly
+    always wins — the profile is merged with the request on top.
+    """
+
+    home_airport: str | None = Field(
+        default=None, description="IATA code the traveler usually departs from."
+    )
+    home_city: str | None = Field(default=None, description="Where the traveler lives.")
+    nationality: str | None = Field(
+        default=None, description="Used for visa and entry requirements."
+    )
+    default_currency: str | None = Field(
+        default=None, description="ISO 4217 code the traveler thinks in."
+    )
+    interests: list[str] = Field(
+        default_factory=list, description="Recurring interests across trips."
+    )
+    constraints: list[str] = Field(
+        default_factory=list,
+        description="Standing limits, e.g. 'vegetarian', 'no early flights'.",
+    )
+    lodging_style: str | None = Field(
+        default=None, description="e.g. 'apartment', 'boutique hotel', 'hostel'."
+    )
+    pace: str | None = Field(
+        default=None,
+        description="How full a day should be: 'relaxed', 'moderate' or 'packed'.",
+    )
+    visited_destinations: list[str] = Field(
+        default_factory=list, description="Places already planned for this traveler."
+    )

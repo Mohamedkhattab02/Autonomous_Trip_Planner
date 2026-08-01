@@ -6,9 +6,7 @@ recommends one with its trade-offs stated.
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
-
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
 from trip_planner.schemas import AgentName, FlightsResult, TravelerProfile
 from trip_planner.state import TripState
 from trip_planner.tools import FLIGHT_TOOLS
@@ -42,8 +40,8 @@ Rules:
 
 def build_flights_agent():
     """Build the Flights Agent runnable."""
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="flights",
         tools=FLIGHT_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         response_format=FlightsResult,
@@ -78,7 +76,7 @@ def _flights_brief(profile: TravelerProfile) -> str:
     )
 
 
-def flights_node(state: TripState) -> dict:
+def flights_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Flights Agent.
 
     Args:
@@ -89,6 +87,9 @@ def flights_node(state: TripState) -> dict:
     """
     profile = state["intake"].profile
     agent = build_flights_agent()
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = agent.invoke(
         {"messages": [{"role": "user", "content": _flights_brief(profile)}]}
     )

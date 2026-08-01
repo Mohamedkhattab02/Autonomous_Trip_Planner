@@ -9,13 +9,18 @@ Usage:
 
 from __future__ import annotations
 
+import time
+
 import gradio as gr
 
-from trip_planner.graph import RECURSION_LIMIT, app as graph_app
+from trip_planner.graph import RECURSION_LIMIT, app as graph_app, initial_state
+from trip_planner.llm import describe_models
 from trip_planner.mcp_client import describe_calendar_backend
 from trip_planner.render import (
     PIPELINE,
     progress_html,
+    render_degraded,
+    render_efficiency,
     render_budget,
     render_calendar,
     render_critic,
@@ -420,6 +425,42 @@ CSS = """
 /* places */
 .tp-place .tp-badges { margin-top: 8px; }
 
+/* deep links out to booking and maps */
+.tp-book {
+    display: inline-block; margin-top: 10px; font-size: 0.83rem; font-weight: 550;
+    text-decoration: none; color: var(--tp-accent);
+    border: 1px solid var(--tp-line); border-radius: 9px; padding: 5px 12px;
+    transition: border-color 0.2s ease, background 0.2s ease;
+}
+.tp-book:hover {
+    border-color: rgba(99, 102, 241, 0.55);
+    background: rgba(99, 102, 241, 0.08);
+}
+.tp-book:focus-visible { outline: 2px solid var(--tp-accent); outline-offset: 2px; }
+
+/* efficiency: one horizontal bar per agent, longest first */
+.tp-bars { display: flex; flex-direction: column; gap: 4px; }
+.tp-bar-row {
+    display: grid; grid-template-columns: 120px 1fr 56px; gap: 10px;
+    align-items: center; padding: 8px 2px;
+    border-bottom: 1px solid var(--tp-line);
+}
+.tp-bar-row:last-child { border-bottom: none; }
+.tp-bar-label { font-size: 0.85rem; font-weight: 600; }
+.tp-bar-track {
+    height: 10px; border-radius: 999px; overflow: hidden;
+    background: rgba(42, 120, 214, 0.15);
+}
+.tp-bar-fill { display: block; height: 100%; border-radius: 999px; }
+.tp-bar-failed { background: var(--tp-critical); }
+.tp-bar-value {
+    font-size: 0.83rem; font-weight: 650; text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.tp-bar-meta {
+    grid-column: 2 / -1; font-size: 0.76rem; color: var(--tp-muted); margin-top: -2px;
+}
+
 footer { display: none !important; }
 """
 
@@ -430,15 +471,16 @@ HEADER = """
      trip — then put it straight on your calendar.</p>
   <div class="tp-tags">
     <span class="tp-tag">🕸 LangGraph</span>
-    <span class="tp-tag">🧠 Gemini 3.5 Flash</span>
+    <span class="tp-tag">🧠 GPT-5 mini</span>
     <span class="tp-tag">🔌 MCP · Google Calendar</span>
     <span class="tp-tag">🌐 Live flight &amp; hotel data</span>
+    <span class="tp-tag">⚡ Parallel agents</span>
   </div>
 </div>
 """
 
 
-def _sections(state: dict, backend: str) -> list[str]:
+def _sections(state: dict, backend: str, wall: float = 0.0) -> list[str]:
     """Render every result panel from the accumulated state.
 
     Args:
@@ -449,7 +491,8 @@ def _sections(state: dict, backend: str) -> list[str]:
         The Markdown for each tab, in the order the UI expects.
     """
     return [
-        render_itinerary(state.get("itinerary"), state.get("routing")),
+        render_degraded(state.get("failed_agents", []))
+        + render_itinerary(state.get("itinerary"), state.get("routing")),
         render_flights(state.get("flights")),
         render_lodging(state.get("lodging")),
         render_places(state.get("attractions")),
@@ -458,6 +501,7 @@ def _sections(state: dict, backend: str) -> list[str]:
         render_calendar(state.get("calendar"), backend),
         render_profile(state.get("intake")),
         render_research(state.get("research")),
+        render_efficiency(state.get("metrics", []), wall, describe_models()),
     ]
 
 
@@ -474,6 +518,7 @@ def plan(request: str):
     labels = {str(name): label for name, label, _ in PIPELINE}
     backend = describe_calendar_backend()
     state: dict = {}
+    started = time.perf_counter()
 
     if not request.strip():
         yield (
@@ -493,12 +538,7 @@ def plan(request: str):
 
     try:
         stream = graph_app.stream(
-            {
-                "user_request": request,
-                "messages": [{"role": "user", "content": request}],
-                "completed_agents": [],
-                "revision_count": 0,
-            },
+            initial_state(request),
             config={"recursion_limit": RECURSION_LIMIT},
             stream_mode="updates",
         )
@@ -519,13 +559,15 @@ def plan(request: str):
                 completed = state.get("completed_agents", [])
                 if node == "manager":
                     decision = state.get("manager_decision")
-                    nxt = decision.next_agent if decision else None
-                    status = (
-                        f"🧭 Manager → **{labels.get(str(nxt), nxt)}**"
-                        if nxt
-                        else "🧭 Manager: the plan is complete."
-                    )
-                    active = str(nxt) if nxt else None
+                    group = decision.next_agents if decision else []
+                    if len(group) > 1:
+                        names = ", ".join(labels.get(str(a), str(a)) for a in group)
+                        status = f"🧭 Manager → **{names}** running in parallel ⚡"
+                    elif group:
+                        status = f"🧭 Manager → **{labels.get(str(group[0]), group[0])}**"
+                    else:
+                        status = "🧭 Manager: the plan is complete."
+                    active = str(group[0]) if group else None
                 else:
                     status = f"✅ {labels.get(node, node)} finished."
                     active = None
@@ -536,7 +578,7 @@ def plan(request: str):
                 yield (
                     progress_html(completed, active),
                     status,
-                    *_sections(state, backend),
+                    *_sections(state, backend, time.perf_counter() - started),
                     gr.update(visible=False),
                 )
 
@@ -554,7 +596,7 @@ def plan(request: str):
         yield (
             progress_html(state.get("completed_agents", [])),
             note,
-            *_sections(state, backend),
+            *_sections(state, backend, time.perf_counter() - started),
             gr.update(visible=False),
         )
         return
@@ -578,7 +620,7 @@ def plan(request: str):
     yield (
         progress_html(state.get("completed_agents", [])),
         final,
-        *_sections(state, backend),
+        *_sections(state, backend, time.perf_counter() - started),
         gr.update(value=ics, visible=bool(ics)),
     )
 
@@ -596,6 +638,19 @@ THEME = gr.themes.Soft(
         gr.themes.Font("sans-serif"),
     ),
 )
+
+
+def _stopped():
+    """Report a cancelled run and restore the Plan button.
+
+    Returns:
+        The status line plus the two button states.
+    """
+    return (
+        "■ **Stopped.** Whatever finished before you stopped is still shown below.",
+        gr.update(visible=True),
+        gr.update(visible=False),
+    )
 
 
 def build_ui() -> gr.Blocks:
@@ -625,8 +680,12 @@ def build_ui() -> gr.Blocks:
                 plan_button = gr.Button(
                     "✨ Plan my trip", variant="primary", size="lg", scale=2
                 )
+                stop_button = gr.Button(
+                    "■ Stop", variant="stop", size="lg", visible=False
+                )
                 gr.Markdown(
-                    f"<div id='tp-status'>📅 {describe_calendar_backend()}</div>"
+                    f"<div id='tp-status'>🧠 {describe_models()}<br>"
+                    f"📅 {describe_calendar_backend()}</div>"
                 )
 
         gr.Examples(examples=EXAMPLES, inputs=request, label="Try one of these")
@@ -655,6 +714,8 @@ def build_ui() -> gr.Blocks:
                 profile = gr.HTML(elem_classes="tp-panel")
             with gr.Tab("🌍 Destination"):
                 research = gr.HTML(elem_classes="tp-panel")
+            with gr.Tab("⚡ Efficiency"):
+                efficiency = gr.HTML(elem_classes="tp-panel")
 
         ics_file = gr.File(label="📎 Add to your calendar (.ics)", visible=False)
 
@@ -670,10 +731,37 @@ def build_ui() -> gr.Blocks:
             calendar,
             profile,
             research,
+            efficiency,
             ics_file,
         ]
-        plan_button.click(plan, inputs=request, outputs=outputs)
-        request.submit(plan, inputs=request, outputs=outputs)
+        # Swap the buttons around the run so Stop is only offered while a plan
+        # is actually in flight.
+        def _running():
+            """Show Stop, hide Plan."""
+            return gr.update(visible=False), gr.update(visible=True)
+
+        def _idle():
+            """Show Plan, hide Stop."""
+            return gr.update(visible=True), gr.update(visible=False)
+
+        buttons = [plan_button, stop_button]
+
+        run_events = []
+        for trigger in (plan_button.click, request.submit):
+            event = trigger(_running, outputs=buttons, queue=False).then(
+                plan, inputs=request, outputs=outputs
+            )
+            event.then(_idle, outputs=buttons, queue=False)
+            run_events.append(event)
+
+        # `cancels` stops the generator mid-plan; the partial results already
+        # streamed into the panels stay on screen.
+        stop_button.click(
+            _stopped,
+            outputs=[status, *buttons],
+            cancels=run_events,
+            queue=False,
+        )
 
     return demo
 

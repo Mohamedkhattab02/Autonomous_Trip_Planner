@@ -20,10 +20,9 @@ from __future__ import annotations
 
 import re
 
-from langchain.agents import create_agent
+from trip_planner.agents.factory import build_structured_agent
 from langchain_core.tools import BaseTool
 
-from trip_planner.llm import get_model
 from trip_planner.mcp_client import load_calendar_tools, run_async
 from trip_planner.schemas import (
     AgentName,
@@ -114,8 +113,8 @@ def build_calendar_agent(tools: list[BaseTool], using_mcp: bool):
     backend_prompt = MCP_PROMPT if using_mcp else LOCAL_PROMPT
     system_prompt = BASE_PROMPT + backend_prompt.format(tool_list=_tool_list(tools))
 
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="calendar",
         tools=tools,
         system_prompt=system_prompt,
         response_format=CalendarResult,
@@ -251,7 +250,7 @@ def _calendar_brief(
     )
 
 
-def calendar_node(state: TripState) -> dict:
+def calendar_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Calendar Agent.
 
     The agent is invoked asynchronously because MCP tools are async-native;
@@ -273,6 +272,9 @@ def calendar_node(state: TripState) -> dict:
         reset_calendar()
 
     agent = build_calendar_agent(tools, using_mcp)
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = run_async(
         agent.ainvoke(
             {

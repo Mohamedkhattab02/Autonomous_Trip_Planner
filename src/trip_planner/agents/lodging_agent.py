@@ -6,9 +6,7 @@ traveler's preferences, and recommends one.
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
-
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
 from trip_planner.schemas import AgentName, LodgingResult, TravelerProfile
 from trip_planner.state import TripState
 from trip_planner.tools import LODGING_TOOLS
@@ -43,8 +41,8 @@ Rules:
 
 def build_lodging_agent():
     """Build the Lodging Agent runnable."""
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="lodging",
         tools=LODGING_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         response_format=LodgingResult,
@@ -83,7 +81,7 @@ def _lodging_brief(profile: TravelerProfile, nights: int) -> str:
     )
 
 
-def lodging_node(state: TripState) -> dict:
+def lodging_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Lodging Agent.
 
     Args:
@@ -99,6 +97,9 @@ def lodging_node(state: TripState) -> dict:
         else 1
     )
     agent = build_lodging_agent()
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = agent.invoke(
         {"messages": [{"role": "user", "content": _lodging_brief(profile, nights)}]}
     )

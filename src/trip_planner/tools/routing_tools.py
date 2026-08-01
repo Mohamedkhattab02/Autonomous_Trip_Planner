@@ -190,3 +190,143 @@ ROUTING_TOOLS = [
     cluster_locations,
     check_opening_hours,
 ]
+
+
+def _parse_window(text: str) -> tuple[int, int] | None:
+    """Read an opening-hours string into minutes-since-midnight bounds.
+
+    Args:
+        text: Hours text as Google reports it, e.g. "10 AM-6 PM" or "10:00-18:00".
+
+    Returns:
+        An `(open, close)` pair in minutes, or None when it cannot be read.
+    """
+    import re
+
+    if not text or "closed" in text.lower():
+        return None
+    if "24 hours" in text.lower() or "open 24" in text.lower():
+        return (0, 24 * 60)
+
+    matches = re.findall(r"(\d{1,2})(?::(\d{2}))?\s*([AaPp][Mm])?", text)
+    bounds = []
+    for hour, minute, meridiem in matches:
+        value = int(hour) % 12 * 60 + int(minute or 0)
+        if (meridiem or "").lower() == "pm":
+            value += 12 * 60
+        elif not meridiem and int(hour) >= 13:
+            value = int(hour) * 60 + int(minute or 0)
+        bounds.append(value)
+        if len(bounds) == 2:
+            break
+
+    if len(bounds) != 2 or bounds[1] <= bounds[0]:
+        return None
+    return (bounds[0], bounds[1])
+
+
+@tool
+def schedule_day(
+    places: list[dict],
+    visit_date: str,
+    day_start: str = "09:00",
+    day_end: str = "21:00",
+) -> dict:
+    """Order and time one day's places so the schedule is actually feasible.
+
+    Greedy insertion under time windows: repeatedly take the place whose
+    opening hours are tightest, place it at the earliest feasible slot, and
+    account for the travel time to reach it. This is deterministic arithmetic —
+    the agent chooses *which* places matter, this decides what is possible.
+
+    Args:
+        places: Places to schedule. Each needs `place_id`, `name`, `latitude`,
+            `longitude` and `visit_duration_minutes`; `opening_hours` and
+            `closed_days` are respected when present.
+        visit_date: The day in YYYY-MM-DD format, used for closing days.
+        day_start: Earliest the traveler will start, "HH:MM".
+        day_end: Latest the traveler will finish, "HH:MM".
+
+    Returns:
+        A dict with `stops` (ordered, with start/end times and travel gaps) and
+        `unscheduled` — places that could not be fitted, with the reason.
+    """
+
+    def to_minutes(text: str) -> int:
+        hour, _, minute = text.partition(":")
+        return int(hour) * 60 + int(minute or 0)
+
+    def to_text(value: int) -> str:
+        return f"{value // 60:02d}:{value % 60:02d}"
+
+    try:
+        weekday = WEEKDAYS[date_type.fromisoformat(visit_date).weekday()].capitalize()
+    except ValueError:
+        return {"stops": [], "unscheduled": [], "error": f"'{visit_date}' is not a date."}
+
+    open_from, close_at = to_minutes(day_start), to_minutes(day_end)
+
+    candidates, unscheduled = [], []
+    for place in places:
+        if weekday in [d.capitalize() for d in place.get("closed_days", [])]:
+            unscheduled.append(
+                {"place_id": place.get("place_id"), "reason": f"closed on {weekday}"}
+            )
+            continue
+        window = _parse_window(str(place.get("opening_hours", ""))) or (open_from, close_at)
+        candidates.append({**place, "window": window})
+
+    # Tightest window first: the hardest places to place go first.
+    candidates.sort(key=lambda p: p["window"][1] - p["window"][0])
+
+    stops: list[dict] = []
+    cursor = open_from
+    previous: dict | None = None
+
+    while candidates:
+        best, best_start, best_travel, best_mode = None, None, 0, "walking"
+        for place in candidates:
+            travel, mode = 0, "walking"
+            if previous is not None:
+                km = haversine_km(
+                    previous["latitude"],
+                    previous["longitude"],
+                    place["latitude"],
+                    place["longitude"],
+                )
+                mode = suggest_mode(km)
+                travel = travel_minutes(km, mode)
+
+            start = max(cursor + travel, place["window"][0])
+            duration = int(place.get("visit_duration_minutes", 90))
+            if start + duration > min(place["window"][1], close_at):
+                continue
+            if best_start is None or start < best_start:
+                best, best_start, best_travel, best_mode = place, start, travel, mode
+
+        if best is None:
+            break
+
+        duration = int(best.get("visit_duration_minutes", 90))
+        stops.append(
+            {
+                "place_id": best.get("place_id"),
+                "name": best.get("name", ""),
+                "start_time": to_text(best_start),
+                "end_time": to_text(best_start + duration),
+                "travel_minutes_from_previous": best_travel,
+                "travel_mode": best_mode,
+            }
+        )
+        cursor = best_start + duration
+        previous = best
+        candidates.remove(best)
+
+    unscheduled += [
+        {"place_id": p.get("place_id"), "reason": "no feasible slot left in the day"}
+        for p in candidates
+    ]
+    return {"stops": stops, "unscheduled": unscheduled, "weekday": weekday}
+
+
+ROUTING_TOOLS.append(schedule_day)

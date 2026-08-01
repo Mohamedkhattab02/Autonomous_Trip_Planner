@@ -7,9 +7,7 @@ interests, each with coordinates, hours and cost.
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
-
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
 from trip_planner.schemas import AgentName, AttractionsResult, TravelerProfile
 from trip_planner.state import TripState
 from trip_planner.tools import ATTRACTION_TOOLS
@@ -23,9 +21,10 @@ Your job is to build a pool of real places the traveler will enjoy. A later
 agent splits them into days, so gather more than one day's worth.
 
 Follow these steps:
-1. Call `search_places` once per interest, e.g. "art museums", then
-   "seafood restaurants", then "viewpoints". One focused search at a time
-   returns far better results than one broad search.
+1. Call `search_places_bulk` ONCE with a list of focused queries, one per
+   interest, e.g. ["art museums", "seafood restaurants", "viewpoints"]. It
+   runs them in parallel, so this is far faster than searching one at a time.
+   Use `search_places` only to follow up on a single gap afterwards.
 2. Include restaurants, not only sights - the traveler has to eat.
 3. Call `get_opening_hours` for any place whose hours came back unknown.
 4. Call `get_place_details` for any place you found through `web_search`, so
@@ -49,8 +48,8 @@ Rules:
 
 def build_attractions_agent():
     """Build the Attractions Agent runnable."""
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="attractions",
         tools=ATTRACTION_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         response_format=AttractionsResult,
@@ -89,7 +88,7 @@ def _attractions_brief(profile: TravelerProfile, days: int) -> str:
     )
 
 
-def attractions_node(state: TripState) -> dict:
+def attractions_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Attractions Agent.
 
     Args:
@@ -105,6 +104,9 @@ def attractions_node(state: TripState) -> dict:
         else 1
     )
     agent = build_attractions_agent()
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = agent.invoke(
         {"messages": [{"role": "user", "content": _attractions_brief(profile, days)}]}
     )

@@ -6,9 +6,10 @@ Reads the user's free-text request and turns it into a validated
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
+import os
 
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
+from trip_planner import memory
 from trip_planner.schemas import AgentName, IntakeResult
 from trip_planner.state import TripState
 from trip_planner.tools import INTAKE_TOOLS
@@ -38,8 +39,8 @@ Rules:
 
 def build_intake_agent():
     """Build the Intake Agent runnable."""
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="intake",
         tools=INTAKE_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         response_format=IntakeResult,
@@ -47,20 +48,76 @@ def build_intake_agent():
     )
 
 
-def intake_node(state: TripState) -> dict:
+def _can_ask() -> bool:
+    """Report whether the graph may pause to ask the traveler a question.
+
+    Interrupting needs a checkpointer to suspend into, and is pointless in a
+    one-shot script, so it is opt-in.
+
+    Returns:
+        True when `TRIP_ASK_USER` is switched on.
+    """
+    return os.getenv("TRIP_ASK_USER", "").strip().lower() in ("1", "true", "yes")
+
+
+def intake_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Intake Agent and store its profile in the state.
 
+    Two things happen around the agent itself:
+
+    * **Stored preferences fill the gaps.** Anything the traveler did not state
+      this time is taken from their saved profile — but never overrides what
+      they did state.
+    * **A missing detail can be asked about.** When required fields are still
+      absent and checkpointing is on, the node calls `interrupt()`. The graph
+      suspends with its state intact, the UI shows the question, and resuming
+      with the answer continues from here rather than replanning from scratch.
+
     Args:
-        state: The shared trip state; reads `user_request`.
+        state: The shared trip state; reads `user_request` and `user_answer`.
+        collector: Optional metrics callback.
 
     Returns:
         A partial state update with the intake result.
     """
+    request = state["user_request"]
+    answer = state.get("user_answer", "")
+    if answer:
+        request = f"{request}\n\nAdditional details from the traveler: {answer}"
+
     agent = build_intake_agent()
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": state["user_request"]}]}
-    )
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
+    result = agent.invoke({"messages": [{"role": "user", "content": request}]})
     intake: IntakeResult = result["structured_response"]
+
+    # Fill anything unstated from the traveler's stored preferences.
+    preferences = memory.load()
+    intake = intake.model_copy(
+        update={"profile": memory.apply(intake.profile, preferences)}
+    )
+
+    # Re-check completeness: a preference may have supplied a missing field.
+    still_missing = [
+        field
+        for field in intake.missing_fields
+        if getattr(intake.profile, field, None) in (None, "")
+    ]
+    intake = intake.model_copy(update={"missing_fields": still_missing})
+
+    if still_missing and not answer and _can_ask():
+        from langgraph.types import interrupt
+
+        # Suspends the graph; resuming supplies the traveler's reply.
+        reply = interrupt(
+            {
+                "question": intake.clarifying_question
+                or "Could you give me a few more details?",
+                "missing_fields": still_missing,
+            }
+        )
+        return {"user_answer": str(reply)}
 
     return {
         "intake": intake,

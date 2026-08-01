@@ -13,6 +13,8 @@ from functools import lru_cache
 
 import serpapi
 
+from trip_planner.tools.cache import TTL_PRICES, cached
+
 
 @lru_cache(maxsize=1)
 def _client() -> serpapi.Client:
@@ -29,6 +31,7 @@ def _client() -> serpapi.Client:
     return serpapi.Client(api_key=api_key)
 
 
+@cached("serpapi", TTL_PRICES)
 def serp_search(**params) -> dict:
     """Run one SerpApi search and return the raw response as a dict.
 

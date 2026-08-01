@@ -6,9 +6,7 @@ covering weather, safety, currency, transport and entry requirements.
 
 from __future__ import annotations
 
-from langchain.agents import create_agent
-
-from trip_planner.llm import get_model
+from trip_planner.agents.factory import build_structured_agent
 from trip_planner.schemas import AgentName, DestinationResearch, TravelerProfile
 from trip_planner.state import TripState
 from trip_planner.tools import RESEARCH_TOOLS
@@ -35,8 +33,8 @@ Rules:
 
 def build_research_agent():
     """Build the Destination Research Agent runnable."""
-    return create_agent(
-        model=get_model(),
+    return build_structured_agent(
+        role="destination_research",
         tools=RESEARCH_TOOLS,
         system_prompt=SYSTEM_PROMPT,
         response_format=DestinationResearch,
@@ -68,7 +66,7 @@ def _research_brief(profile: TravelerProfile) -> str:
     )
 
 
-def research_node(state: TripState) -> dict:
+def research_node(state: TripState, collector=None) -> dict:
     """Graph node: run the Destination Research Agent.
 
     Args:
@@ -79,6 +77,9 @@ def research_node(state: TripState) -> dict:
     """
     profile = state["intake"].profile
     agent = build_research_agent()
+    if collector is not None:
+        # Route this agent's token and tool usage into the run metrics.
+        agent = agent.with_config(callbacks=[collector])
     result = agent.invoke(
         {"messages": [{"role": "user", "content": _research_brief(profile)}]}
     )

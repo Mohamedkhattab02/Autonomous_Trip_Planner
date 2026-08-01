@@ -270,14 +270,33 @@ class TestRouting:
     def test_routes_to_the_chosen_agent(self):
         state = {
             "manager_decision": ManagerDecision(
-                next_agent=AgentName.FLIGHTS, reasoning="time to book"
+                next_agent=AgentName.FLIGHTS,
+                next_agents=[AgentName.FLIGHTS],
+                reasoning="time to book",
             )
         }
-        assert route_from_manager(state) == FLIGHTS
+        assert route_from_manager(state) == [FLIGHTS]
+
+    def test_dispatches_a_parallel_group_as_a_list(self):
+        """Returning a list is what makes LangGraph run the branches at once."""
+        group = [
+            AgentName.DESTINATION_RESEARCH,
+            AgentName.FLIGHTS,
+            AgentName.LODGING,
+            AgentName.ATTRACTIONS,
+        ]
+        state = {
+            "manager_decision": ManagerDecision(
+                next_agent=group[0], next_agents=group, reasoning="all independent"
+            )
+        }
+        assert route_from_manager(state) == [str(agent) for agent in group]
 
     def test_finishes_when_no_agent_is_chosen(self):
         state = {
-            "manager_decision": ManagerDecision(next_agent=None, reasoning="all done")
+            "manager_decision": ManagerDecision(
+                next_agent=None, next_agents=[], reasoning="all done"
+            )
         }
         assert route_from_manager(state) == "finish"
 
