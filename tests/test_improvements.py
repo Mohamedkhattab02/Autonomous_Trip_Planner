@@ -830,3 +830,161 @@ def factory_dir() -> str:
     import trip_planner.agents as agents_package
 
     return str(__import__("pathlib").Path(agents_package.__file__).parent)
+
+
+# ---------------------------------------------------------------------------
+# Regression — human-in-the-loop must survive the resilience wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestInterruptRegression:
+    """Guards the cascade that turned one clarifying question into 11 failures.
+
+    `interrupt()` suspends the graph by raising `GraphInterrupt`. The retry and
+    failure-containment wrappers caught it as an ordinary error, so intake was
+    recorded as failed, its result slot stayed empty, and every downstream
+    agent then died with `KeyError: 'intake'`.
+    """
+
+    def test_an_interrupt_is_not_treated_as_a_failure(self, monkeypatch):
+        monkeypatch.setattr("trip_planner.resilience.time.sleep", lambda _: None)
+        from langgraph.errors import GraphInterrupt
+
+        @resilient_node(AgentName.INTAKE)
+        def node(state):
+            raise GraphInterrupt(("need the dates",))
+
+        with pytest.raises(GraphInterrupt):
+            node({})
+
+    def test_an_interrupt_is_never_retried(self, monkeypatch):
+        """Retrying a suspend would ask the traveler the same question again."""
+        monkeypatch.setattr("trip_planner.resilience.time.sleep", lambda _: None)
+        from langgraph.errors import GraphInterrupt
+
+        attempts = {"n": 0}
+
+        def asking():
+            attempts["n"] += 1
+            raise GraphInterrupt(("need the dates",))
+
+        with pytest.raises(GraphInterrupt):
+            with_retry(asking, "intake")()
+        assert attempts["n"] == 1
+
+    def test_real_errors_are_still_contained(self, monkeypatch):
+        """The fix must not stop ordinary failures from degrading gracefully."""
+        monkeypatch.setattr("trip_planner.resilience.time.sleep", lambda _: None)
+
+        @resilient_node(AgentName.FLIGHTS)
+        def node(state):
+            raise RuntimeError("SerpApi is down")
+
+        assert node({})["failed_agents"][0]["agent"] == "flights"
+
+    def test_nothing_is_dispatched_when_intake_produced_no_profile(self):
+        """The cascade: an empty `intake` slot must stop the pipeline dead."""
+        state = _fresh()
+        state["intake"] = None
+        state["completed_agents"] = [AgentName.INTAKE]
+        state["failed_agents"] = [{"agent": "intake", "error": "boom"}]
+        assert next_required_agents(state) == []
+
+    def test_the_real_graph_suspends_and_asks(self, tmp_path, monkeypatch):
+        """End to end: the graph must pause with the question, not fail.
+
+        Only the manager and intake run before the suspend, and neither touches
+        the network here — the manager's routing is templated and intake is
+        stubbed — so this exercises the real graph offline.
+        """
+        from langgraph.checkpoint.memory import MemorySaver
+
+        from trip_planner.agents import intake_agent
+        from trip_planner.graph import compile_graph, initial_state
+
+        monkeypatch.setattr("trip_planner.memory.PROFILES_DIR", tmp_path)
+        monkeypatch.setenv("TRIP_ASK_USER", "true")
+
+        incomplete = IntakeResult(
+            profile=TravelerProfile(destination="Rome"),
+            missing_fields=["start_date", "end_date"],
+            clarifying_question="When does the trip start and end?",
+        )
+        monkeypatch.setattr(
+            intake_agent, "build_intake_agent", lambda: StubAgent(incomplete)
+        )
+
+        graph = compile_graph(MemorySaver())
+        config = {"configurable": {"thread_id": "test-hitl"}, "recursion_limit": 20}
+
+        chunks = list(
+            graph.stream(
+                initial_state("a week in Rome"), config=config, stream_mode="updates"
+            )
+        )
+
+        interrupts = [c for c in chunks if "__interrupt__" in c]
+        assert interrupts, "the graph must suspend, not finish"
+
+        payload = interrupts[0]["__interrupt__"][0].value
+        assert payload["missing_fields"] == ["start_date", "end_date"]
+        assert "start" in payload["question"].lower()
+
+        # Nothing may have been recorded as failed.
+        failures = [
+            entry
+            for chunk in chunks
+            for update in chunk.values()
+            if isinstance(update, dict)
+            for entry in update.get("failed_agents", [])
+        ]
+        assert failures == [], f"a suspend is not a failure: {failures}"
+
+    def test_resuming_feeds_the_answer_back_in(self, tmp_path, monkeypatch):
+        """`Command(resume=...)` must continue the same run, not restart it."""
+        from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.types import Command
+
+        from trip_planner.agents import intake_agent
+        from trip_planner.graph import compile_graph, initial_state
+
+        monkeypatch.setattr("trip_planner.memory.PROFILES_DIR", tmp_path)
+        monkeypatch.setenv("TRIP_ASK_USER", "true")
+
+        seen: list[str] = []
+        incomplete = IntakeResult(
+            profile=TravelerProfile(destination="Rome"),
+            missing_fields=["start_date", "end_date"],
+            clarifying_question="When does the trip start and end?",
+        )
+
+        class RecordingAgent(StubAgent):
+            def invoke(self, payload, config=None):
+                seen.append(payload["messages"][0]["content"])
+                return super().invoke(payload, config)
+
+        monkeypatch.setattr(
+            intake_agent, "build_intake_agent", lambda: RecordingAgent(incomplete)
+        )
+
+        graph = compile_graph(MemorySaver())
+        config = {"configurable": {"thread_id": "test-resume"}, "recursion_limit": 20}
+        list(
+            graph.stream(
+                initial_state("a week in Rome"), config=config, stream_mode="updates"
+            )
+        )
+        list(
+            graph.stream(
+                Command(resume="10-15 September 2026"),
+                config=config,
+                stream_mode="updates",
+            )
+        )
+
+        # LangGraph replays an interrupted node from the top when it resumes,
+        # so intake is invoked more than twice. What matters is the last call:
+        # it must carry the traveler's answer *and* the original request.
+        assert len(seen) >= 2, "intake should have re-run after the answer"
+        assert "10-15 September 2026" in seen[-1], "the answer must reach the agent"
+        assert "a week in Rome" in seen[-1], "the original request must be kept"

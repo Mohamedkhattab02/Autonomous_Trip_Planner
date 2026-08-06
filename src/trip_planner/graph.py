@@ -27,6 +27,7 @@ destroy the other ten.
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 
 from langgraph.graph import END, START, StateGraph
@@ -186,6 +187,45 @@ def initial_state(user_request: str) -> dict:
         "budget_version": 0,
         "critic_version": 0,
         "revision_count": 0,
+    }
+
+
+@lru_cache(maxsize=1)
+def checkpointed_app():
+    """Return a graph compiled against a long-lived SQLite checkpointer.
+
+    The connection is deliberately kept open for the life of the process, and
+    `check_same_thread=False` because Gradio serves each request on a different
+    worker thread. Both are needed for human-in-the-loop: `interrupt()` has to
+    suspend into a checkpoint that a *later* HTTP request can resume from.
+
+    Returns:
+        The compiled app, or the plain in-memory app when checkpointing is off.
+    """
+    if not checkpointing_enabled():
+        return app
+
+    import sqlite3
+
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(CHECKPOINT_PATH), check_same_thread=False)
+    return compile_graph(SqliteSaver(connection))
+
+
+def run_config(thread_id: str) -> dict:
+    """Build the run config for one plan.
+
+    Args:
+        thread_id: Identifies this plan, so it can be resumed.
+
+    Returns:
+        A LangGraph config.
+    """
+    return {
+        "recursion_limit": RECURSION_LIMIT,
+        "configurable": {"thread_id": thread_id},
     }
 
 

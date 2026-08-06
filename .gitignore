@@ -21,7 +21,7 @@ client_secret*.json
 .gcp-saved-tokens.json
 
 # Generated artifacts
-graph.png
+
 .pytest_cache/
 exports/
 credentials/

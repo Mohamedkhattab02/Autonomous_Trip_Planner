@@ -10,10 +10,13 @@ Usage:
 from __future__ import annotations
 
 import time
+import uuid
 
 import gradio as gr
+from langgraph.types import Command
 
-from trip_planner.graph import RECURSION_LIMIT, app as graph_app, initial_state
+from trip_planner.export import to_pdf
+from trip_planner.graph import checkpointed_app, initial_state, run_config
 from trip_planner.llm import describe_models
 from trip_planner.mcp_client import describe_calendar_backend
 from trip_planner.render import (
@@ -505,6 +508,176 @@ def _sections(state: dict, backend: str, wall: float = 0.0) -> list[str]:
     ]
 
 
+def _outputs(state, backend, wall, status, active=None, question="", thread=""):
+    """Assemble one full set of UI outputs.
+
+    Args:
+        state: The merged graph state so far.
+        backend: The active calendar backend.
+        wall: Seconds elapsed so far.
+        status: The status line to show.
+        active: The node currently running, if any.
+        question: A clarifying question to put to the traveler, if any.
+        thread: The run's thread id, carried in `gr.State` for the resume.
+
+    Returns:
+        A tuple matching the `outputs` list in `build_ui`.
+    """
+    itinerary = state.get("itinerary")
+    calendar = state.get("calendar")
+    ics = getattr(calendar, "ics_path", None) if calendar else None
+
+    pdf = None
+    if itinerary is not None and itinerary.days:
+        try:
+            pdf = to_pdf(itinerary)
+        except Exception:  # noqa: BLE001 - a failed PDF must not fail the plan
+            pdf = None
+
+    return (
+        progress_html(state.get("completed_agents", []), active),
+        status,
+        *_sections(state, backend, wall),
+        gr.update(value=ics, visible=bool(ics)),
+        gr.update(value=pdf, visible=bool(pdf)),
+        gr.update(value=question, visible=bool(question)),
+        gr.update(visible=bool(question)),
+        thread,
+    )
+
+
+def _final_status(state: dict) -> str:
+    """Describe how the run ended.
+
+    Args:
+        state: The final state.
+
+    Returns:
+        A status line for the traveler.
+    """
+    failed = state.get("failed_agents", [])
+    intake = state.get("intake")
+
+    if intake is not None and not intake.is_complete:
+        return "\u2753 I still need a few details before I can plan this trip."
+    if failed:
+        return (
+            f"\u26a0\ufe0f **Finished, but incomplete** - {len(failed)} stage(s) "
+            "failed. See the banner on the Itinerary tab."
+        )
+    return "\U0001f389 **Your trip is ready.** Download it as a PDF below."
+
+
+def _error_status(exc: Exception) -> str:
+    """Turn an exception into something a traveler can act on.
+
+    Args:
+        exc: Whatever escaped the run.
+
+    Returns:
+        A status line.
+    """
+    message = str(exc)
+    lowered = message.lower()
+    if "429" in message or "resource_exhausted" in lowered or "quota" in lowered:
+        return (
+            "\U0001f6d1 **Rate limit or quota reached.** The provider is refusing "
+            "further requests right now - wait a moment, or check your limits."
+        )
+    if "401" in message or "api key" in lowered:
+        return (
+            "\U0001f6d1 **The API key was rejected.** Check `LLM_MODEL` and the "
+            "matching key in `.env`."
+        )
+    return f"\U0001f6d1 **The run failed:** {message[:400]}"
+
+
+def _drive(stream, state, backend, started, thread):
+    """Consume a graph stream, yielding UI updates as each node finishes.
+
+    Shared by the first run and by the resume after a clarifying question, so
+    both behave identically.
+
+    Args:
+        stream: The LangGraph update stream.
+        state: The accumulated state, mutated in place.
+        backend: The active calendar backend.
+        started: `perf_counter` value when the run began.
+        thread: The run's thread id.
+
+    Yields:
+        Full output tuples.
+    """
+    labels = {str(name): label for name, label, _ in PIPELINE}
+
+    for chunk in stream:
+        # LangGraph reports a suspend under this key. Stop and ask.
+        if "__interrupt__" in chunk:
+            payload = chunk["__interrupt__"]
+            value = getattr(payload[0], "value", {}) if payload else {}
+            question = value.get("question") or "Could you give me a few more details?"
+            missing = ", ".join(value.get("missing_fields", []))
+            status = "\u2753 **I need a little more.** " + question
+            if missing:
+                status += "  \n_Missing: " + missing + "_"
+            yield _outputs(
+                state,
+                backend,
+                time.perf_counter() - started,
+                status,
+                question=question,
+                thread=thread,
+            )
+            return
+
+        for node, update in chunk.items():
+            if not isinstance(update, dict):
+                continue
+
+            for key, value in update.items():
+                if key in ("completed_agents", "metrics", "failed_agents"):
+                    state.setdefault(key, [])
+                    state[key] = state[key] + list(value)
+                else:
+                    state[key] = value
+
+            if node == "manager":
+                decision = state.get("manager_decision")
+                group = decision.next_agents if decision else []
+                if len(group) > 1:
+                    names = ", ".join(labels.get(str(a), str(a)) for a in group)
+                    status = f"\U0001f9ed Manager -> **{names}** running in parallel \u26a1"
+                elif group:
+                    label = labels.get(str(group[0]), str(group[0]))
+                    status = f"\U0001f9ed Manager -> **{label}**"
+                else:
+                    status = "\U0001f9ed Manager: the plan is complete."
+                active = str(group[0]) if group else None
+            else:
+                status = f"\u2705 {labels.get(node, node)} finished."
+                active = None
+
+            if state.get("revision_count"):
+                status += f"  \u00b7  \U0001f504 revision {state['revision_count']}"
+
+            yield _outputs(
+                state,
+                backend,
+                time.perf_counter() - started,
+                status,
+                active,
+                thread=thread,
+            )
+
+    yield _outputs(
+        state,
+        backend,
+        time.perf_counter() - started,
+        _final_status(state),
+        thread=thread,
+    )
+
+
 def plan(request: str):
     """Run the planner, yielding UI updates as each agent finishes.
 
@@ -512,117 +685,85 @@ def plan(request: str):
         request: The traveler's free-text request.
 
     Yields:
-        The progress tracker, a status line, every result panel, and the
-        downloadable .ics file once the Calendar Agent has run.
+        Full output tuples; pauses with a question when intake needs more.
     """
-    labels = {str(name): label for name, label, _ in PIPELINE}
     backend = describe_calendar_backend()
     state: dict = {}
     started = time.perf_counter()
 
     if not request.strip():
-        yield (
-            progress_html([]),
-            "⚠️ Tell me where you want to go first.",
-            *_sections({}, backend),
-            gr.update(visible=False),
+        yield _outputs(
+            {}, backend, 0.0, "\u26a0\ufe0f Tell me where you want to go first."
         )
         return
 
-    yield (
-        progress_html([], active="intake"),
-        "🚀 Starting — the Travel Manager is deciding what to do first…",
-        *_sections({}, backend),
-        gr.update(visible=False),
+    thread = uuid.uuid4().hex
+    yield _outputs(
+        {},
+        backend,
+        0.0,
+        "\U0001f680 Starting - the Travel Manager is deciding what to do first...",
+        active="intake",
+        thread=thread,
     )
 
     try:
-        stream = graph_app.stream(
-            initial_state(request),
-            config={"recursion_limit": RECURSION_LIMIT},
-            stream_mode="updates",
+        stream = checkpointed_app().stream(
+            initial_state(request), config=run_config(thread), stream_mode="updates"
+        )
+        yield from _drive(stream, state, backend, started, thread)
+    except Exception as exc:  # noqa: BLE001 - surface any failure in the UI
+        yield _outputs(
+            state,
+            backend,
+            time.perf_counter() - started,
+            _error_status(exc),
+            thread=thread,
         )
 
-        for chunk in stream:
-            for node, update in chunk.items():
-                if not isinstance(update, dict):
-                    continue
 
-                # Merge this node's partial update into our view of the state.
-                for key, value in update.items():
-                    if key == "completed_agents":
-                        state.setdefault("completed_agents", [])
-                        state["completed_agents"] += value
-                    else:
-                        state[key] = value
+def answer(reply: str, thread: str):
+    """Resume a paused plan with the traveler's answer.
 
-                completed = state.get("completed_agents", [])
-                if node == "manager":
-                    decision = state.get("manager_decision")
-                    group = decision.next_agents if decision else []
-                    if len(group) > 1:
-                        names = ", ".join(labels.get(str(a), str(a)) for a in group)
-                        status = f"🧭 Manager → **{names}** running in parallel ⚡"
-                    elif group:
-                        status = f"🧭 Manager → **{labels.get(str(group[0]), group[0])}**"
-                    else:
-                        status = "🧭 Manager: the plan is complete."
-                    active = str(group[0]) if group else None
-                else:
-                    status = f"✅ {labels.get(node, node)} finished."
-                    active = None
+    Args:
+        reply: What the traveler typed.
+        thread: The thread id of the suspended run.
 
-                if state.get("revision_count"):
-                    status += f"  ·  🔄 revision {state['revision_count']}"
+    Yields:
+        Full output tuples, continuing from where the graph suspended.
+    """
+    backend = describe_calendar_backend()
+    state: dict = {}
+    started = time.perf_counter()
 
-                yield (
-                    progress_html(completed, active),
-                    status,
-                    *_sections(state, backend, time.perf_counter() - started),
-                    gr.update(visible=False),
-                )
-
-    except Exception as exc:  # noqa: BLE001 - surface any failure in the UI
-        message = str(exc)
-        if "RESOURCE_EXHAUSTED" in message or "429" in message:
-            note = (
-                "🛑 **Gemini quota exhausted.** A free-tier key allows 20 requests "
-                "per day, and a full eleven-agent run needs more than that. "
-                "Enable billing on the key, or try again tomorrow."
-            )
-        else:
-            note = f"🛑 **The run failed:** {message[:400]}"
-
-        yield (
-            progress_html(state.get("completed_agents", [])),
-            note,
-            *_sections(state, backend, time.perf_counter() - started),
-            gr.update(visible=False),
+    if not reply.strip() or not thread:
+        yield _outputs(
+            state, backend, 0.0, "\u26a0\ufe0f Type the missing details first.",
+            thread=thread,
         )
         return
 
-    # Offer the .ics for download when one was written locally.
-    calendar = state.get("calendar")
-    ics = getattr(calendar, "ics_path", None) if calendar else None
-    intake = state.get("intake")
-
-    if intake is not None and not intake.is_complete:
-        final = "❓ I need a few more details before I can plan this trip."
-    else:
-        final = "🎉 **Your trip is ready.** " + (
-            "Events were added to your Google Calendar."
-            if calendar and not ics and calendar.events
-            else "Download the calendar file below."
-            if ics
-            else ""
-        )
-
-    yield (
-        progress_html(state.get("completed_agents", [])),
-        final,
-        *_sections(state, backend, time.perf_counter() - started),
-        gr.update(value=ics, visible=bool(ics)),
+    yield _outputs(
+        state,
+        backend,
+        0.0,
+        "\U0001f501 Thanks - picking up where I left off...",
+        thread=thread,
     )
+
+    try:
+        stream = checkpointed_app().stream(
+            Command(resume=reply), config=run_config(thread), stream_mode="updates"
+        )
+        yield from _drive(stream, state, backend, started, thread)
+    except Exception as exc:  # noqa: BLE001 - surface any failure in the UI
+        yield _outputs(
+            state,
+            backend,
+            time.perf_counter() - started,
+            _error_status(exc),
+            thread=thread,
+        )
 
 
 # Fonts must be Font objects, not bare strings: Gradio compares the theme
@@ -717,7 +858,21 @@ def build_ui() -> gr.Blocks:
             with gr.Tab("⚡ Efficiency"):
                 efficiency = gr.HTML(elem_classes="tp-panel")
 
-        ics_file = gr.File(label="📎 Add to your calendar (.ics)", visible=False)
+        with gr.Row():
+            ics_file = gr.File(label="📎 Add to your calendar (.ics)", visible=False)
+            pdf_file = gr.File(label="📄 Download the plan (PDF)", visible=False)
+
+        # Shown only when the Intake Agent needs a detail it was not given.
+        answer_box = gr.Textbox(
+            label="Your answer",
+            placeholder="e.g. 10-15 September 2026",
+            lines=2,
+            visible=False,
+        )
+        answer_button = gr.Button("↩ Continue planning", variant="primary", visible=False)
+
+        # Carries the run's thread id so the resume lands on the same graph.
+        thread_state = gr.State("")
 
         outputs = [
             progress,
@@ -733,6 +888,10 @@ def build_ui() -> gr.Blocks:
             research,
             efficiency,
             ics_file,
+            pdf_file,
+            answer_box,
+            answer_button,
+            thread_state,
         ]
         # Swap the buttons around the run so Stop is only offered while a plan
         # is actually in flight.
@@ -756,6 +915,14 @@ def build_ui() -> gr.Blocks:
 
         # `cancels` stops the generator mid-plan; the partial results already
         # streamed into the panels stay on screen.
+        # Answering a clarifying question resumes the same suspended run.
+        for trigger in (answer_button.click, answer_box.submit):
+            event = trigger(_running, outputs=buttons, queue=False).then(
+                answer, inputs=[answer_box, thread_state], outputs=outputs
+            )
+            event.then(_idle, outputs=buttons, queue=False)
+            run_events.append(event)
+
         stop_button.click(
             _stopped,
             outputs=[status, *buttons],

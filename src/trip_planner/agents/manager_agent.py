@@ -83,9 +83,11 @@ def next_required_agents(state: TripState) -> list[AgentName]:
     if AgentName.INTAKE not in completed:
         return [AgentName.INTAKE]
 
-    # Nothing downstream can proceed on an incomplete profile.
+    # Nothing downstream can proceed without a profile. If intake failed, the
+    # slot is empty — dispatching anyway is what used to cascade one failure
+    # into ten, every downstream agent raising KeyError: 'intake'.
     intake = state.get("intake")
-    if intake is not None and not intake.is_complete:
+    if intake is None or not intake.is_complete:
         return []
 
     # Fan out: every one of these needs only the profile.

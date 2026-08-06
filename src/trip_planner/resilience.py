@@ -18,6 +18,8 @@ import logging
 import time
 from typing import Callable
 
+from langgraph.errors import GraphBubbleUp
+
 from trip_planner.schemas import AgentName
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,12 @@ def with_retry(func: Callable, name: str) -> Callable:
         for attempt in range(MAX_ATTEMPTS):
             try:
                 return func(*args, **kwargs)
+            except GraphBubbleUp:
+                # Not a failure: LangGraph's own control flow. `interrupt()`
+                # raises this to suspend the graph and ask the traveler a
+                # question. Retrying it would re-ask; catching it would strand
+                # the run. It has to travel up untouched.
+                raise
             except Exception as exc:  # noqa: BLE001 - classified below
                 last = exc
                 kind = classify(exc)
@@ -127,6 +135,9 @@ def resilient_node(agent: AgentName) -> Callable:
         def wrapper(state) -> dict:
             try:
                 return retrying(state)
+            except GraphBubbleUp:
+                # See `with_retry`: this is a suspend/resume signal, not an error.
+                raise
             except Exception as exc:  # noqa: BLE001 - contained deliberately
                 logger.error("%s failed permanently: %s", agent, exc)
                 return {
