@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+import os
 import time
 import uuid
 
@@ -939,8 +940,21 @@ def build_ui() -> gr.Blocks:
 
 
 def main() -> None:
-    """Launch the trip planner UI in a browser."""
-    build_ui().launch(theme=THEME, css=CSS, inbrowser=True)
+    """Launch the trip planner UI.
+
+    Locally this opens a browser on 127.0.0.1. In a container the host must be
+    0.0.0.0 or the platform cannot reach the app; Render also picks the port
+    itself and passes it as $PORT, so that wins over the Gradio default.
+    """
+    host = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
+    port = int(os.getenv("PORT") or os.getenv("GRADIO_SERVER_PORT") or 7860)
+    build_ui().launch(
+        theme=THEME,
+        css=CSS,
+        server_name=host,
+        server_port=port,
+        inbrowser=host == "127.0.0.1",
+    )
 
 
 if __name__ == "__main__":

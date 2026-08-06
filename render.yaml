@@ -1,0 +1,49 @@
+# Render blueprint. Create the service with "New > Blueprint" and point it at
+# this repository; Render reads this file instead of asking for the settings.
+#
+# The three API keys are marked `sync: false`, so Render prompts for them once
+# and stores them as secrets rather than keeping them in the repo.
+
+services:
+  - type: web
+    name: autonomous-trip-planner
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /
+
+    envVars:
+      # Prompted on first deploy, then stored encrypted.
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: SERPAPI_API_KEY
+        sync: false
+
+      # Gradio must bind every interface or Render cannot route to it. The
+      # port itself comes from $PORT, which Render injects.
+      - key: GRADIO_SERVER_NAME
+        value: 0.0.0.0
+
+      - key: LLM_MODEL
+        value: openai:gpt-5-mini
+
+      - key: TRIP_CACHE_ENABLED
+        value: "true"
+      - key: TRIP_CHECKPOINTS
+        value: "true"
+      - key: EXPLAIN_ROUTING
+        value: "false"
+
+      # The Google OAuth flow needs an interactive browser, which a Render
+      # service has no way to open. Off here, the Calendar Agent exports .ics.
+      - key: CALENDAR_MCP_ENABLED
+        value: "false"
+
+    # Cache and checkpoints are written at runtime. Without a disk they reset
+    # on every deploy and restart, which costs API calls but breaks nothing.
+    disk:
+      name: planner-data
+      mountPath: /app/.cache
+      sizeGB: 1

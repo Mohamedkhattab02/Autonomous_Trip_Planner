@@ -1,0 +1,31 @@
+# Keeps the build context small and keeps secrets out of the image.
+# The virtualenv is the big one: uv builds a fresh one inside the container,
+# so shipping the local .venv only slows every upload to Render.
+
+.venv/
+.git/
+__pycache__/
+*.py[oc]
+.pytest_cache/
+
+# Secrets. The image gets its keys from the environment at runtime.
+.env
+.env.*
+!.env.example
+credentials/
+*oauth*.json
+client_secret*.json
+tokens.json
+.gcp-saved-tokens.json
+
+# Written at runtime, restored from the mounted disk.
+.cache/
+.checkpoints/
+exports/
+profiles/
+benchmarks/
+
+# Docs and artifacts the running app never reads. README.md is deliberately
+# absent from this list: hatchling needs it to build the package.
+*.png
+.dist/

@@ -27,6 +27,9 @@ RUN uv sync --frozen --no-install-project
 COPY src/ ./src/
 COPY app.py main.py ./
 COPY scripts/ ./scripts/
+# pyproject declares `readme = "README.md"`, and hatchling validates that the
+# file exists when it builds this package. Without it `uv sync` fails.
+COPY README.md ./
 RUN uv sync --frozen
 
 # Written at runtime; mounted as volumes in compose so they survive a rebuild.
