@@ -8,7 +8,7 @@ Agent for a revision.
 
 from __future__ import annotations
 
-from trip_planner.agents.factory import build_structured_agent
+from trip_planner.agents.factory import build_structured_agent, run_agent
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
@@ -166,26 +166,17 @@ def critic_node(state: TripState, collector=None) -> dict:
         duplicate entry to `completed_agents`.
     """
     profile = state["intake"].profile
-    agent = build_critic_agent()
-    if collector is not None:
-        # Route this agent's token and tool usage into the run metrics.
-        agent = agent.with_config(callbacks=[collector])
-    result = agent.invoke(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": _critic_brief(
-                        profile,
-                        state.get("routing"),
-                        state.get("attractions"),
-                        state.get("budget"),
-                    ),
-                }
-            ]
-        }
+    critic: CriticResult = run_agent(
+        build_critic_agent(),
+        _critic_brief(
+            profile,
+            state.get("routing"),
+            state.get("attractions"),
+            state.get("budget"),
+        ),
+        role="critic",
+        collector=collector,
     )
-    critic: CriticResult = result["structured_response"]
 
     update: dict = {
         "critic": critic,

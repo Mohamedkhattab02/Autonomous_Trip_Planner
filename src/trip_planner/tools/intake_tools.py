@@ -52,9 +52,29 @@ def validate_required_fields(
     return {"missing_fields": missing, "is_complete": not missing}
 
 
+# How each field is put to a traveler. A name that is not here is asked about
+# by name, which reads acceptably for a real field ("origin") — but only for a
+# real one, which is why blanks are dropped rather than passed through.
+READABLE_FIELDS: dict[str, str] = {
+    "destination": "where you want to go",
+    "start_date": "when the trip starts",
+    "end_date": "when the trip ends",
+    "travelers": "how many people are travelling",
+    "budget_amount": "your total budget",
+    "budget_currency": "which currency your budget is in",
+    "origin": "which city you are flying from",
+    "interests": "what you would like to do there",
+    "constraints": "anything the trip has to work around",
+}
+
+
 @tool
 def ask_clarifying_question(missing_fields: list[str]) -> str:
     """Build one question that asks the user for all missing trip details.
+
+    Blank entries are dropped rather than asked about: a field name the caller
+    could not fill in is not something a traveler can answer, and asking
+    produced the empty question "Could you tell me ??".
 
     Args:
         missing_fields: Names of the fields that are still unknown.
@@ -63,17 +83,11 @@ def ask_clarifying_question(missing_fields: list[str]) -> str:
         A single question to put to the user, or a confirmation that nothing
         is missing.
     """
-    if not missing_fields:
+    names = [str(field).strip() for field in missing_fields if str(field).strip()]
+    if not names:
         return "All required trip details are present; no question is needed."
 
-    readable = {
-        "destination": "where you want to go",
-        "start_date": "when the trip starts",
-        "end_date": "when the trip ends",
-        "travelers": "how many people are travelling",
-        "budget_amount": "your total budget",
-    }
-    parts = [readable.get(field, field) for field in missing_fields]
+    parts = [READABLE_FIELDS.get(name, name.replace("_", " ")) for name in names]
     if len(parts) == 1:
         return f"Could you tell me {parts[0]}?"
     return f"Could you tell me {', '.join(parts[:-1])} and {parts[-1]}?"

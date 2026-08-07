@@ -20,7 +20,11 @@ from __future__ import annotations
 
 import re
 
-from trip_planner.agents.factory import build_structured_agent
+from trip_planner.agents.factory import (
+    AgentOutputError,
+    agent_config,
+    build_structured_agent,
+)
 from langchain_core.tools import BaseTool
 
 from trip_planner.mcp_client import load_calendar_tools, run_async
@@ -272,29 +276,29 @@ def calendar_node(state: TripState, collector=None) -> dict:
         reset_calendar()
 
     agent = build_calendar_agent(tools, using_mcp)
-    if collector is not None:
-        # Route this agent's token and tool usage into the run metrics.
-        agent = agent.with_config(callbacks=[collector])
+    brief = _calendar_brief(
+        profile,
+        state.get("itinerary"),
+        state.get("flights"),
+        state.get("lodging"),
+        filename,
+        using_mcp,
+    )
+    # Invoked here rather than through `run_agent` because MCP tools are
+    # async-native; the config it would have built is used unchanged.
     result = run_async(
         agent.ainvoke(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": _calendar_brief(
-                            profile,
-                            state.get("itinerary"),
-                            state.get("flights"),
-                            state.get("lodging"),
-                            filename,
-                            using_mcp,
-                        ),
-                    }
-                ]
-            }
+            {"messages": [{"role": "user", "content": brief}]},
+            agent_config("calendar", collector),
         )
     )
-    calendar: CalendarResult = result["structured_response"]
+
+    calendar: CalendarResult | None = result.get("structured_response")
+    if calendar is None:
+        raise AgentOutputError(
+            "the calendar agent finished without reporting the events it "
+            "created, so there is nothing to record for this stage"
+        )
 
     return {
         "calendar": calendar,

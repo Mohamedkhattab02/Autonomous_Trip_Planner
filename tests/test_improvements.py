@@ -527,6 +527,29 @@ class TestExport:
 class TestCache:
     """Repeated identical lookups must not repeat the network call."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_cache(self, tmp_path, monkeypatch):
+        """Give each test its own cache directory.
+
+        These tests used to write into the project's real cache with a 60s TTL,
+        so running the suite twice inside a minute served the *first* call from
+        the previous run's entry and the count came back 0 instead of 1. The
+        test failed for a reason that had nothing to do with the code, and it
+        polluted the cache the app actually uses.
+
+        Args:
+            tmp_path: A per-test directory.
+            monkeypatch: Used to repoint the cache and reset its handle.
+        """
+        from trip_planner.tools import cache as cache_module
+
+        monkeypatch.setattr(cache_module, "CACHE_DIR", tmp_path / "tools")
+        monkeypatch.setattr(cache_module, "_cache", None)
+        yield
+        store, cache_module._cache = cache_module._cache, None
+        if store is not None:
+            store.close()
+
     def test_the_key_depends_on_the_arguments(self):
         assert _key("t", {"q": "a"}) == _key("t", {"q": "a"})
         assert _key("t", {"q": "a"}) != _key("t", {"q": "b"})
@@ -1027,3 +1050,802 @@ class TestInterruptRegression:
         assert len(seen) >= 2, "intake should have re-run after the answer"
         assert "10-15 September 2026" in seen[-1], "the answer must reach the agent"
         assert "a week in Rome" in seen[-1], "the original request must be kept"
+
+
+# ---------------------------------------------------------------------------
+# Regression â€” the Itinerary Agent's deterministic-tool loop
+# ---------------------------------------------------------------------------
+
+
+class TestItineraryLoopRegression:
+    """Guards the loop that stopped runs from ever reaching the Calendar stage.
+
+    `read_agent_results` reads state that cannot change while the itinerary
+    node runs, so every call returned the same dict. A model that read it as
+    "not done yet" called it again, and again, until the sub-agent's steps ran
+    out â€” leaving no itinerary, and no calendar.
+    """
+
+    def _state(self) -> dict:
+        """Build a state with every stage before the itinerary completed.
+
+        Returns:
+            A `TripState`-shaped dict.
+        """
+        from trip_planner.schemas import (
+            BudgetLine,
+            BudgetResult,
+            DestinationResearch,
+            FlightLeg,
+            FlightOption,
+            FlightsResult,
+            LodgingOption,
+            LodgingResult,
+            Source,
+        )
+
+        return {
+            "intake": IntakeResult(
+                profile=TravelerProfile(
+                    destination="Lisbon, Portugal",
+                    start_date=date(2026, 9, 10),
+                    end_date=date(2026, 9, 12),
+                    travelers=2,
+                    budget_amount=2000,
+                    budget_currency="EUR",
+                )
+            ),
+            "research": DestinationResearch(
+                destination="Lisbon",
+                summary="Coastal capital.",
+                weather="Warm, around 25C.",
+                safety="Watch for pickpockets on tram 28.",
+                currency="Euro.",
+                transportation="Metro and trams.",
+                entry_requirements="An EU ID card is enough.",
+                sources=[Source(title="t", url="https://example.com")],
+            ),
+            "flights": FlightsResult(
+                options=[
+                    FlightOption(
+                        option_id="flight-1",
+                        legs=[
+                            FlightLeg(
+                                airline="TAP",
+                                flight_number="TP1",
+                                departure_airport="TLV",
+                                arrival_airport="LIS",
+                                departure_time="2026-09-10 08:00",
+                                arrival_time="2026-09-10 12:00",
+                                duration_minutes=240,
+                            )
+                        ],
+                        stops=0,
+                        total_duration_minutes=240,
+                        price=900,
+                        currency="EUR",
+                    )
+                ],
+                recommended_option_id="flight-1",
+                reasoning="cheapest direct",
+            ),
+            "lodging": LodgingResult(
+                options=[
+                    LodgingOption(
+                        option_id="stay-1",
+                        name="Hotel Alfama",
+                        address="Rua 1",
+                        total_price=400,
+                        price_per_night=200,
+                        currency="EUR",
+                    )
+                ],
+                recommended_option_id="stay-1",
+                reasoning="central",
+            ),
+            "budget": BudgetResult(
+                lines=[BudgetLine(category="flights", amount=900)],
+                total_cost=1500,
+                budget_amount=2000,
+                currency="EUR",
+                within_budget=True,
+                reasoning="comfortable",
+            ),
+            "routing": RoutingResult(
+                days=[
+                    DayPlan(
+                        day_number=1,
+                        date=date(2026, 9, 10),
+                        summary="Old town",
+                        stops=[
+                            ScheduledStop(
+                                place_id="place-1",
+                                name="Sao Jorge Castle",
+                                start_time=time(10, 0),
+                                end_time=time(11, 30),
+                            )
+                        ],
+                    )
+                ],
+                reasoning="clustered",
+            ),
+            "critic": CriticResult(
+                issues=[
+                    Issue(
+                        severity=Severity.WARNING,
+                        category="schedule",
+                        description="Day 1 is tight.",
+                    ),
+                    Issue(
+                        severity=Severity.BLOCKER,
+                        category="facts",
+                        description="Already sent back to routing.",
+                    ),
+                ],
+                approved=True,
+                reasoning="ships with warnings",
+            ),
+        }
+
+    def test_read_agent_results_answers_once_per_run(self):
+        """A repeat call must not be able to look like progress."""
+        from trip_planner.tools.itinerary_tools import make_read_agent_results
+
+        state = self._state()
+        read = make_read_agent_results(state)
+
+        first = read.invoke({})
+        assert "routing" in first, "the first call carries the data"
+
+        for _ in range(3):
+            again = read.invoke({})
+            assert list(again) == ["note"], "a repeat call must return no data"
+            assert "again" in again["note"].lower(), "it must say to stop calling"
+
+        # The budget is per node run, not global: the next run reads normally.
+        assert "routing" in make_read_agent_results(state).invoke({})
+
+    def test_blockers_stay_out_of_the_travelers_notes(self):
+        """Blockers went back to Routing; only warnings reach the traveler."""
+        from trip_planner.tools.itinerary_tools import make_read_agent_results
+
+        results = make_read_agent_results(self._state()).invoke({})
+
+        severities = {
+            issue["severity"] for issue in results["critic"]["remaining_issues"]
+        }
+        assert "blocker" not in severities
+
+    def test_the_agent_gets_its_own_step_budget(self, monkeypatch):
+        """The sub-agent must not be free to spend the whole graph's steps."""
+        from trip_planner.agents import itinerary_agent
+        from trip_planner.graph import RECURSION_LIMIT
+
+        assert itinerary_agent.STEP_LIMIT < RECURSION_LIMIT
+
+        seen: list[dict] = []
+
+        class ConfigRecordingAgent(StubAgent):
+            def invoke(self, payload, config=None):
+                seen.append(config or {})
+                return super().invoke(payload, config)
+
+        monkeypatch.setattr(
+            itinerary_agent,
+            "build_itinerary_agent",
+            lambda state: ConfigRecordingAgent(
+                ItineraryResult(title="t", overview="o", markdown="# t")
+            ),
+        )
+
+        itinerary_agent.itinerary_node(self._state())
+
+        assert seen[0]["recursion_limit"] == itinerary_agent.STEP_LIMIT
+
+    def test_a_looping_agent_still_produces_a_plan(self, monkeypatch):
+        """Running out of steps must not cost the traveler the itinerary."""
+        from langgraph.errors import GraphRecursionError
+
+        from trip_planner.agents import itinerary_agent
+
+        class LoopingAgent:
+            def invoke(self, payload, config=None):
+                raise GraphRecursionError("recursion limit reached")
+
+        monkeypatch.setattr(
+            itinerary_agent, "build_itinerary_agent", lambda state: LoopingAgent()
+        )
+
+        update = itinerary_agent.itinerary_node(self._state())
+        itinerary = update["itinerary"]
+
+        assert AgentName.ITINERARY in update["completed_agents"]
+        assert itinerary.days, "the routed days must survive"
+        assert itinerary.days[0].stops[0].name == "Sao Jorge Castle"
+        assert itinerary.markdown, "the traveler still needs a readable plan"
+        assert "TAP" in itinerary.flight_summary
+        assert "Hotel Alfama" in itinerary.lodging_summary
+        assert "1,500 EUR" in itinerary.budget_summary
+        assert any("Weather" in note for note in itinerary.practical_notes)
+        assert any("Day 1 is tight" in note for note in itinerary.practical_notes)
+        assert not any(
+            "sent back to routing" in note for note in itinerary.practical_notes
+        )
+
+    def test_the_calendar_stage_is_reached_after_the_itinerary(self):
+        """Whatever the itinerary node does, Calendar is what runs next."""
+        state = {
+            **self._state(),
+            "completed_agents": [
+                AgentName.INTAKE,
+                *PARALLEL_AFTER_INTAKE,
+                AgentName.ROUTING,
+                AgentName.BUDGET,
+                AgentName.CRITIC,
+                AgentName.ITINERARY,
+            ],
+        }
+
+        assert next_required_agents(state) == [AgentName.CALENDAR]
+
+    def test_what_the_agent_wrote_is_never_overwritten(self):
+        """The backstop fills gaps; it does not rewrite the model's prose."""
+        from trip_planner.agents import itinerary_agent
+
+        state = self._state()
+        written = ItineraryResult(
+            title="Three Days in Lisbon",
+            overview="A short city break.",
+            flight_summary="TAP, morning out and evening back.",
+        )
+
+        repaired = itinerary_agent._repair(written, state, state["intake"].profile, 3)
+
+        assert repaired.title == "Three Days in Lisbon"
+        assert repaired.overview == "A short city break."
+        assert repaired.flight_summary == "TAP, morning out and evening back."
+        assert repaired.lodging_summary, "the gap is still filled"
+        assert repaired.markdown, "and the document is still rendered"
+
+
+# ---------------------------------------------------------------------------
+# Regression â€” the size of the attractions pool
+# ---------------------------------------------------------------------------
+
+
+class TestPlacesCap:
+    """Every place is carried whole through Routing and the Critic.
+
+    A week-long trip used to ask for 28 of them and a bulk search could hand
+    back ~50, so the cap is enforced in the tools *and* on the agent's answer.
+    """
+
+    def test_the_pool_is_capped_however_long_the_trip(self):
+        from trip_planner.agents.attractions_agent import pool_size
+
+        assert pool_size(3) == 12, "a short trip is still sized by its days"
+        assert pool_size(7) == 15, "a long one is capped, not 28"
+        assert pool_size(30) == 15
+        assert pool_size(0) >= 1
+
+    def test_the_cap_is_configurable(self, monkeypatch):
+        from trip_planner.agents.attractions_agent import pool_size
+        from trip_planner.tools.attraction_tools import max_total_places
+
+        assert max_total_places() == 15
+
+        monkeypatch.setenv("TRIP_MAX_PLACES", "6")
+        assert max_total_places() == 6
+        assert pool_size(7) == 6
+
+        monkeypatch.setenv("TRIP_MAX_PLACES", "not a number")
+        assert max_total_places() == 15, "a bad value must fall back, not crash"
+
+    def test_an_oversized_answer_is_trimmed(self):
+        """A prompt asking for a number is a request, not a limit."""
+        from trip_planner.agents.attractions_agent import _capped
+
+        pool = AttractionsResult(
+            places=[
+                Place(
+                    place_id=f"place-{index}",
+                    name=f"Place {index}",
+                    category="museum",
+                    coordinates=Coordinates(latitude=38.7, longitude=-9.1),
+                )
+                for index in range(40)
+            ],
+            reasoning="everything I found",
+        )
+
+        trimmed = _capped(pool, 15)
+
+        assert len(trimmed.places) == 15
+        assert trimmed.places[0].name == "Place 0", "the agent's ordering is kept"
+
+    def test_bulk_search_spends_the_cap_across_every_interest(self, monkeypatch):
+        """A small pool must stay balanced, not fill up with the first query."""
+        from trip_planner.tools import attraction_tools
+
+        def fake_serp(engine, q, type, hl):
+            query = q.split(" in ")[0]
+            return {
+                "local_results": [
+                    {
+                        "title": f"{query}-{rank}",
+                        "place_id": f"{query}-{rank}",
+                        "gps_coordinates": {"latitude": 38.7, "longitude": -9.1},
+                    }
+                    for rank in range(10)
+                ]
+            }
+
+        monkeypatch.setattr(attraction_tools, "serp_search", fake_serp)
+
+        result = attraction_tools.search_places_bulk.invoke(
+            {
+                "queries": ["museums", "food", "views", "parks", "bars"],
+                "destination": "Lisbon",
+            }
+        )
+        names = [place["name"] for place in result["places"]]
+
+        assert len(names) == 15, "50 hits must come back as 15"
+        assert {name.rsplit("-", 1)[0] for name in names} == {
+            "museums",
+            "food",
+            "views",
+            "parks",
+            "bars",
+        }, "every interest must be represented"
+        assert names[:5] == [
+            "museums-0",
+            "food-0",
+            "views-0",
+            "parks-0",
+            "bars-0",
+        ], "best hits first, one interest at a time"
+
+
+
+# ---------------------------------------------------------------------------
+# Regression â€” every agent is bounded and answers structurally
+# ---------------------------------------------------------------------------
+
+
+class ConfigRecorder(StubAgent):
+    """A stub agent that remembers the run config it was invoked with."""
+
+    def __init__(self, response) -> None:
+        super().__init__(response)
+        self.config: dict | None = None
+
+    def invoke(self, payload, config=None):
+        """Record the config, then answer.
+
+        Args:
+            payload: Ignored message payload.
+            config: The run config the node built.
+
+        Returns:
+            A dict shaped like a real agent result.
+        """
+        self.config = config
+        return super().invoke(payload, config)
+
+    async def ainvoke(self, payload, config=None):
+        """Async twin, for the Calendar Agent.
+
+        Args:
+            payload: Ignored message payload.
+            config: The run config the node built.
+
+        Returns:
+            A dict shaped like a real agent result.
+        """
+        return self.invoke(payload, config)
+
+
+class TestAgentInvocation:
+    """One invocation path for eleven agents, so these hold for all of them.
+
+    Before `run_agent`, every node invoked its own agent and inherited two
+    problems from doing so: none passed a `recursion_limit`, so a sub-agent
+    looping on a tool spent the graph's whole budget (80 steps, ~40 model
+    calls) before anything stopped it; and a model that answered in prose died
+    on `KeyError: 'structured_response'`, which named neither the agent nor the
+    problem.
+    """
+
+    def test_every_role_has_a_step_budget_below_the_graphs(self):
+        from trip_planner.agents.factory import STEP_LIMITS, step_limit
+        from trip_planner.graph import RECURSION_LIMIT, SPECIALISTS
+
+        for role in [str(name) for name in SPECIALISTS] + ["manager"]:
+            assert role in STEP_LIMITS, f"{role} would inherit the graph's limit"
+            assert 0 < step_limit(role) < RECURSION_LIMIT, role
+
+    def test_a_prose_answer_raises_a_readable_error(self):
+        """Not `KeyError: 'structured_response'`, which named nothing."""
+        from trip_planner.agents.factory import AgentOutputError, run_agent
+
+        class Prose:
+            def invoke(self, payload, config=None):
+                return {"messages": ["I am afraid I cannot do that"]}
+
+        with pytest.raises(AgentOutputError) as raised:
+            run_agent(Prose(), "brief", "lodging")
+
+        assert "lodging" in str(raised.value)
+
+    def test_run_agent_carries_the_limit_and_the_collector(self):
+        from trip_planner.agents.factory import STEP_LIMITS, run_agent
+
+        agent = ConfigRecorder(APPROVED)
+        run_agent(agent, "brief", "critic", collector="metrics-callback")
+
+        assert agent.config["recursion_limit"] == STEP_LIMITS["critic"]
+        assert agent.config["callbacks"] == ["metrics-callback"]
+
+    def test_every_node_bounds_its_agent(self, monkeypatch, tmp_path):
+        """A table of all ten specialists, so none of them can be forgotten."""
+        from trip_planner.agents import (
+            attractions_agent,
+            budget_agent,
+            calendar_agent,
+            critic_agent,
+            flights_agent,
+            intake_agent,
+            itinerary_agent,
+            lodging_agent,
+            research_agent,
+            routing_agent,
+        )
+        from trip_planner.agents.factory import STEP_LIMITS
+        from trip_planner.schemas import (
+            BudgetResult,
+            CalendarResult,
+            DestinationResearch,
+            FlightsResult,
+            LodgingResult,
+        )
+
+        monkeypatch.setattr("trip_planner.memory.PROFILES_DIR", tmp_path)
+        monkeypatch.setattr(calendar_agent, "load_calendar_tools", lambda: ([], False))
+
+        pool = AttractionsResult(
+            places=[
+                Place(
+                    place_id="place-1",
+                    name="Castle",
+                    category="landmark",
+                    coordinates=Coordinates(latitude=38.7, longitude=-9.1),
+                )
+            ],
+            reasoning="r",
+        )
+        plan = RoutingResult(
+            days=[DayPlan(day_number=1, date=date(2026, 9, 10))], reasoning="r"
+        )
+        state = {
+            "user_request": "3 days in Lisbon for 2, 2000 EUR",
+            "intake": IntakeResult(
+                profile=TravelerProfile(
+                    destination="Lisbon, Portugal",
+                    start_date=date(2026, 9, 10),
+                    end_date=date(2026, 9, 12),
+                    travelers=2,
+                    budget_amount=2000,
+                )
+            ),
+            "attractions": pool,
+            "routing": plan,
+        }
+
+        cases = [
+            (
+                "intake",
+                intake_agent,
+                "build_intake_agent",
+                intake_agent.intake_node,
+                IntakeResult(profile=TravelerProfile(destination="Lisbon")),
+            ),
+            (
+                "destination_research",
+                research_agent,
+                "build_research_agent",
+                research_agent.research_node,
+                DestinationResearch(
+                    destination="Lisbon",
+                    summary="s",
+                    weather="w",
+                    safety="s",
+                    currency="EUR",
+                    transportation="metro",
+                    entry_requirements="EU ID",
+                ),
+            ),
+            (
+                "flights",
+                flights_agent,
+                "build_flights_agent",
+                flights_agent.flights_node,
+                FlightsResult(reasoning="r"),
+            ),
+            (
+                "lodging",
+                lodging_agent,
+                "build_lodging_agent",
+                lodging_agent.lodging_node,
+                LodgingResult(reasoning="r"),
+            ),
+            (
+                "attractions",
+                attractions_agent,
+                "build_attractions_agent",
+                attractions_agent.attractions_node,
+                pool,
+            ),
+            (
+                "routing",
+                routing_agent,
+                "build_routing_agent",
+                routing_agent.routing_node,
+                plan,
+            ),
+            (
+                "budget",
+                budget_agent,
+                "build_budget_agent",
+                budget_agent.budget_node,
+                BudgetResult(
+                    total_cost=10, currency="EUR", within_budget=True, reasoning="r"
+                ),
+            ),
+            (
+                "critic",
+                critic_agent,
+                "build_critic_agent",
+                critic_agent.critic_node,
+                APPROVED,
+            ),
+            (
+                "itinerary",
+                itinerary_agent,
+                "build_itinerary_agent",
+                itinerary_agent.itinerary_node,
+                ItineraryResult(title="t", overview="o", markdown="# t"),
+            ),
+            (
+                "calendar",
+                calendar_agent,
+                "build_calendar_agent",
+                calendar_agent.calendar_node,
+                CalendarResult(reasoning="r"),
+            ),
+        ]
+
+        assert len(cases) == 10, "every specialist must be in this table"
+
+        for role, module, builder, node, response in cases:
+            agent = ConfigRecorder(response)
+            monkeypatch.setattr(module, builder, lambda *a, _agent=agent, **k: _agent)
+
+            node(state)
+
+            assert agent.config is not None, f"{role} was invoked without a config"
+            assert agent.config["recursion_limit"] == STEP_LIMITS[role], role
+
+    def test_tool_using_prompts_forbid_repeat_calls(self, monkeypatch):
+        """The rule lives in the factory, so no prompt can be left without it."""
+        from trip_planner.agents import factory, intake_agent, lodging_agent
+
+        built: dict = {}
+
+        def spy(**kwargs):
+            built[kwargs["name"]] = kwargs
+            return StubAgent(None)
+
+        monkeypatch.setattr(factory, "create_agent", spy)
+
+        lodging_agent.build_lodging_agent()
+        intake_agent.build_intake_agent()
+
+        with_tools = built["lodging_agent"]
+        assert with_tools["tools"], "the lodging agent has tools"
+        assert factory.TOOL_DISCIPLINE.strip() in with_tools["system_prompt"]
+
+        without_tools = built["intake_agent"]
+        assert not without_tools["tools"], "the intake agent deliberately has none"
+        assert factory.TOOL_DISCIPLINE.strip() not in without_tools["system_prompt"]
+
+
+# ---------------------------------------------------------------------------
+# Regression â€” the empty clarifying question
+# ---------------------------------------------------------------------------
+
+
+class TestIntakeMissingFields:
+    """Guards "Could you tell me ??", which stopped a complete request.
+
+    The model is told to leave `missing_fields` empty and mostly does, but it
+    has returned `[""]`. The old filter kept anything whose attribute was
+    empty, and `getattr(profile, "", None)` is None, so junk always survived: a
+    complete profile was reported incomplete, the planner stopped before it
+    started, and the traveler was asked a question with no subject.
+    """
+
+    def _complete(self) -> TravelerProfile:
+        """Return a profile with every required field filled in.
+
+        Returns:
+            The profile.
+        """
+        return TravelerProfile(
+            destination="Rome, Italy",
+            start_date=date(2027, 5, 3),
+            end_date=date(2027, 5, 7),
+            travelers=2,
+            budget_amount=2500,
+        )
+
+    @pytest.mark.parametrize("junk", [[""], ["   "], ["notes"], ["preferred_airline"]])
+    def test_junk_flags_are_dropped(self, junk):
+        from trip_planner.agents.intake_agent import _extra_missing
+
+        profile = self._complete()
+
+        assert _extra_missing(IntakeResult(profile=profile, missing_fields=junk), profile) == []
+
+    def test_a_real_empty_field_is_still_kept(self):
+        from trip_planner.agents.intake_agent import _extra_missing
+
+        profile = self._complete()
+        result = IntakeResult(profile=profile, missing_fields=["origin"])
+
+        assert _extra_missing(result, profile) == ["origin"]
+
+    def test_a_complete_profile_asks_nothing(self, tmp_path, monkeypatch):
+        from trip_planner.agents.intake_agent import _finalize
+
+        monkeypatch.setattr("trip_planner.memory.PROFILES_DIR", tmp_path)
+
+        finalized = _finalize(IntakeResult(profile=self._complete(), missing_fields=[""]))
+
+        assert finalized.is_complete
+        assert finalized.missing_fields == []
+        assert finalized.clarifying_question is None
+
+    def test_no_question_is_ever_empty(self):
+        from trip_planner.tools.intake_tools import ask_clarifying_question
+
+        assert "??" not in ask_clarifying_question.invoke({"missing_fields": [""]})
+        assert (
+            ask_clarifying_question.invoke({"missing_fields": ["origin"]})
+            == "Could you tell me which city you are flying from?"
+        )
+        assert "when the trip starts" in ask_clarifying_question.invoke(
+            {"missing_fields": ["start_date", "end_date"]}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression â€” a failed stage must not take the next one with it
+# ---------------------------------------------------------------------------
+
+
+class TestCascadeContainment:
+    """A failed agent is still marked complete, so the next stage is dispatched.
+
+    Routing then read `state["attractions"]` and died on a `KeyError`, turning
+    one failed stage into two.
+    """
+
+    def _state(self) -> dict:
+        """Return a state holding only a usable profile.
+
+        Returns:
+            The state.
+        """
+        return {
+            "intake": IntakeResult(
+                profile=TravelerProfile(
+                    destination="Lisbon, Portugal",
+                    start_date=date(2026, 9, 10),
+                    end_date=date(2026, 9, 12),
+                )
+            )
+        }
+
+    def test_routing_without_a_pool_returns_an_empty_plan(self):
+        from trip_planner.agents.routing_agent import routing_node
+
+        update = routing_node(self._state())
+
+        assert update["routing"].days == []
+        assert "no places" in update["routing"].reasoning
+        assert AgentName.ROUTING in update["completed_agents"]
+        assert update["plan_version"] == 1, "the version still moves on"
+
+    def test_routing_with_an_empty_pool_does_not_call_the_model(self, monkeypatch):
+        from trip_planner.agents import routing_agent
+
+        def fail(*args, **kwargs):
+            raise AssertionError("no model call is warranted with nothing to schedule")
+
+        monkeypatch.setattr(routing_agent, "build_routing_agent", fail)
+        state = {
+            **self._state(),
+            "attractions": AttractionsResult(places=[], reasoning="none found"),
+        }
+
+        assert routing_agent.routing_node(state)["routing"].days == []
+
+    def test_manager_narration_failure_does_not_stop_the_graph(self, monkeypatch):
+        """The router is not wrapped by `resilient_node`, so it contains itself."""
+        from trip_planner.agents import manager_agent
+
+        monkeypatch.setenv("EXPLAIN_ROUTING", "true")
+
+        class Broken:
+            def invoke(self, payload, config=None):
+                raise RuntimeError("provider is down")
+
+        monkeypatch.setattr(manager_agent, "build_manager_agent", lambda state: Broken())
+
+        update = manager_agent.manager_node(self._state())
+
+        assert update["manager_decision"].reasoning, "the template still explains it"
+        assert update["manager_decision"].next_agents
+
+
+# ---------------------------------------------------------------------------
+# Regression â€” checkpoint deserialization warnings
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointSerde:
+    """LangGraph warns on every unregistered type it reads from a checkpoint.
+
+    It is a real deprecation - resuming stops working once the block lands -
+    and the state is almost entirely this project's own models, so every
+    resumed run printed a wall of them.
+    """
+
+    def test_the_projects_types_are_declared(self):
+        from trip_planner.graph import checkpoint_serializer
+
+        allowed = checkpoint_serializer()._allowed_msgpack_modules
+
+        for expected in (
+            ("trip_planner.schemas", "AgentName"),
+            ("trip_planner.schemas", "IntakeResult"),
+            ("trip_planner.schemas", "ManagerDecision"),
+            ("trip_planner.metrics", "AgentMetrics"),
+        ):
+            assert expected in allowed, expected
+
+    def test_a_round_trip_is_clean_and_lossless(self, caplog):
+        import logging
+
+        from trip_planner.graph import checkpoint_serializer
+
+        serde = checkpoint_serializer()
+        payload = {
+            "intake": IntakeResult(profile=TravelerProfile(destination="Rome, Italy")),
+            "completed_agents": [AgentName.INTAKE, AgentName.LODGING],
+            "metrics": [AgentMetrics(agent="lodging", seconds=1.0, llm_calls=2, model="m")],
+        }
+
+        with caplog.at_level(
+            logging.WARNING, logger="langgraph.checkpoint.serde.jsonplus"
+        ):
+            restored = serde.loads_typed(serde.dumps_typed(payload))
+
+        assert restored["intake"].profile.destination == "Rome, Italy"
+        assert restored["completed_agents"][0] is AgentName.INTAKE
+        assert restored["metrics"][0].agent == "lodging"
+        assert [
+            record for record in caplog.records if "unregistered" in record.getMessage()
+        ] == []
+

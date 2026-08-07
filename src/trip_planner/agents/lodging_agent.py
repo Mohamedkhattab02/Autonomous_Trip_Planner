@@ -6,7 +6,7 @@ traveler's preferences, and recommends one.
 
 from __future__ import annotations
 
-from trip_planner.agents.factory import build_structured_agent
+from trip_planner.agents.factory import build_structured_agent, run_agent
 from trip_planner.schemas import AgentName, LodgingResult, TravelerProfile
 from trip_planner.state import TripState
 from trip_planner.tools import LODGING_TOOLS
@@ -15,15 +15,20 @@ SYSTEM_PROMPT = """You are the Lodging Agent of an autonomous trip planner.
 
 Your job is to find real places to stay and recommend one.
 
-Follow these steps:
-1. Call `search_hotels` for the destination, the trip dates and the number of
-   travelers. If a nightly budget was given, pass it as `max_price_per_night`.
-2. Call `compare_hotels` on the results to rank them by price against rating.
-3. For the top few, call `check_hotel_location` against the landmarks the
-   traveler will actually visit, to confirm the location is genuinely central.
-4. Call `get_hotel_details` on the leading option when you need amenities or
-   check-in times to justify the recommendation.
-5. Return the ranked options with a recommendation.
+Follow these steps, in order:
+1. Call `search_hotels` ONCE for the destination, the trip dates and the number
+   of travelers. If a nightly budget was given, pass it as
+   `max_price_per_night`. Whatever it returns is what the destination has - a
+   second search with the same dates returns the same stays.
+2. Call `compare_hotels` ONCE on those results to rank them by price against
+   rating.
+3. For the top two or three only, call `check_hotel_location` against the
+   landmarks the traveler will actually visit, to confirm the location is
+   genuinely central. One call per hotel.
+4. Call `get_hotel_details` on the leading option only if you still need
+   amenities or check-in times to justify the recommendation.
+5. Return the ranked options with a recommendation. Do not go back and search
+   again.
 
 Rules:
 - Report only stays that `search_hotels` actually returned. Never invent a
@@ -96,14 +101,12 @@ def lodging_node(state: TripState, collector=None) -> dict:
         if profile.start_date and profile.end_date
         else 1
     )
-    agent = build_lodging_agent()
-    if collector is not None:
-        # Route this agent's token and tool usage into the run metrics.
-        agent = agent.with_config(callbacks=[collector])
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": _lodging_brief(profile, nights)}]}
+    lodging: LodgingResult = run_agent(
+        build_lodging_agent(),
+        _lodging_brief(profile, nights),
+        role="lodging",
+        collector=collector,
     )
-    lodging: LodgingResult = result["structured_response"]
 
     return {
         "lodging": lodging,

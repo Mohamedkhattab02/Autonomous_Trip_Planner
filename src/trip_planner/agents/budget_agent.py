@@ -7,7 +7,7 @@ concrete cuts when it does not.
 
 from __future__ import annotations
 
-from trip_planner.agents.factory import build_structured_agent
+from trip_planner.agents.factory import build_structured_agent, run_agent
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
@@ -190,28 +190,19 @@ def budget_node(state: TripState, collector=None) -> dict:
         else 1
     )
 
-    agent = build_budget_agent()
-    if collector is not None:
-        # Route this agent's token and tool usage into the run metrics.
-        agent = agent.with_config(callbacks=[collector])
-    result = agent.invoke(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": _budget_brief(
-                        profile,
-                        state.get("flights"),
-                        state.get("lodging"),
-                        state.get("routing"),
-                        state.get("attractions"),
-                        days,
-                    ),
-                }
-            ]
-        }
+    budget: BudgetResult = run_agent(
+        build_budget_agent(),
+        _budget_brief(
+            profile,
+            state.get("flights"),
+            state.get("lodging"),
+            state.get("routing"),
+            state.get("attractions"),
+            days,
+        ),
+        role="budget",
+        collector=collector,
     )
-    budget: BudgetResult = result["structured_response"]
 
     update: dict = {
         "budget": budget,

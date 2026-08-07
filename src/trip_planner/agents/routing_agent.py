@@ -6,11 +6,20 @@ when it is closed.
 
 This is also the agent the Critic sends work back to: when a plan is rejected,
 the graph returns here with the issues attached.
+
+**Why it checks the pool first.** A failed stage is still marked complete, so
+that the graph carries on rather than stalling — which means Routing can be
+dispatched after an Attractions run that produced nothing. Reading
+`state["attractions"]` then raised `KeyError: 'attractions'`, turning one
+failed stage into two. There is no plan to build without places, so the node
+says exactly that and returns an empty one.
 """
 
 from __future__ import annotations
 
-from trip_planner.agents.factory import build_structured_agent
+import logging
+
+from trip_planner.agents.factory import build_structured_agent, run_agent
 from trip_planner.schemas import (
     AgentName,
     AttractionsResult,
@@ -20,6 +29,8 @@ from trip_planner.schemas import (
 )
 from trip_planner.state import TripState
 from trip_planner.tools import ROUTING_TOOLS
+
+logger = logging.getLogger(__name__)
 
 # The traveler's day. Stops are scheduled inside this window.
 DAY_START = "09:00"
@@ -167,7 +178,7 @@ def routing_node(state: TripState, collector=None) -> dict:
         A partial state update with the day-by-day plan.
     """
     profile = state["intake"].profile
-    attractions = state["attractions"]
+    attractions = state.get("attractions")
     critic = state.get("critic")
     is_revision = critic is not None and not critic.approved
 
@@ -177,21 +188,24 @@ def routing_node(state: TripState, collector=None) -> dict:
         else 1
     )
 
-    agent = build_routing_agent()
-    if collector is not None:
-        # Route this agent's token and tool usage into the run metrics.
-        agent = agent.with_config(callbacks=[collector])
-    result = agent.invoke(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": _routing_brief(profile, attractions, critic, days),
-                }
-            ]
-        }
-    )
-    routing: RoutingResult = result["structured_response"]
+    if attractions is None or not attractions.places:
+        # Nothing to schedule. Spending a model call to be told that helps
+        # no one, and the empty plan says it plainly downstream.
+        logger.warning("routing has no places to work with; returning an empty plan")
+        routing = RoutingResult(
+            days=[],
+            reasoning=(
+                "The attractions stage produced no places, so there was "
+                "nothing to distribute across the days."
+            ),
+        )
+    else:
+        routing = run_agent(
+            build_routing_agent(),
+            _routing_brief(profile, attractions, critic, days),
+            role="routing",
+            collector=collector,
+        )
 
     # A new set of days is a new plan version: Budget and Critic are now stale.
     update: dict = {

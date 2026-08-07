@@ -5,6 +5,17 @@ the Itinerary Agent can pull every other agent's output without it all being
 pasted into the prompt. `build_daily_itinerary` and `format_trip_plan` are
 plain Python: the day structure and the Markdown layout are presentation
 rules of the system, not something the model should improvise each run.
+
+**Why `read_agent_results` only answers once.** It is a pure read of state:
+nothing it reports can change while the itinerary node runs, so calling it a
+second time returns a byte-identical dict. A model that reads that dict and
+decides it is "not done yet" therefore calls it again, reads the same answer,
+and calls it again — the same deterministic-tool loop that cost the Intake
+Agent its tools (see `intake_agent`), except here it burned the sub-agent's
+whole step budget before the run could reach the Calendar stage. The tool now
+serves the data on the first call and, on any call after that, returns a short
+instruction to stop reading and start writing. A repeat call can no longer look
+like progress, so the loop cannot sustain itself.
 """
 
 from __future__ import annotations
@@ -19,21 +30,44 @@ from trip_planner.state import TripState
 def make_read_agent_results(state: TripState) -> Callable:
     """Build a `read_agent_results` tool bound to one graph invocation's state.
 
+    The tool is single-shot per node run: the first call returns every agent's
+    output, and any later call returns only an instruction to move on. See this
+    module's docstring for why.
+
     Args:
         state: The state as seen by the itinerary node on this turn.
 
     Returns:
         A LangChain tool that returns every agent's structured output.
     """
+    served = False
 
     @tool
     def read_agent_results() -> dict:
         """Read every agent's result: research, flights, lodging, plan, budget.
 
+        Call this exactly once. The results cannot change while you work, so a
+        second call returns nothing new.
+
         Returns:
             A dict with one entry per agent that has run, holding its
             structured output.
         """
+        nonlocal served
+        if served:
+            # Nothing has changed since the first call, so saying so is more
+            # useful than handing back the identical dict to loop on.
+            return {
+                "note": (
+                    "You already have every agent's output from your first "
+                    "call and nothing has changed since. Do not call this tool "
+                    "again. Build the itinerary from those results now: call "
+                    "`build_daily_itinerary`, then `format_trip_plan`, then "
+                    "return your answer."
+                )
+            }
+        served = True
+
         results: dict = {}
         for key in ("intake", "research", "flights", "lodging", "budget", "routing"):
             value = state.get(key)

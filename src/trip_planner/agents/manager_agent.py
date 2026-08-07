@@ -20,12 +20,17 @@ Three things make this cheap and correct:
 
 from __future__ import annotations
 
+import logging
 import os
 
-from trip_planner.agents.factory import build_structured_agent
+from langgraph.errors import GraphBubbleUp
+
+from trip_planner.agents.factory import build_structured_agent, run_agent
 from trip_planner.schemas import AgentName, ManagerDecision
 from trip_planner.state import TripState
 from trip_planner.tools import delegate_to_agent, make_read_trip_state
+
+logger = logging.getLogger(__name__)
 
 # How many times the Critic may send the plan back before the planner accepts
 # it as good as it will get.
@@ -213,24 +218,27 @@ def manager_node(state: TripState, collector=None) -> dict:
     reasoning = _template_reasoning(state, agents)
 
     if explain_with_llm():
-        agent = build_manager_agent(state)
-        config = {"callbacks": [collector]} if collector else {}
-        result = agent.invoke(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Trip request: {state.get('user_request', '')}\n"
-                            f"About to run: {', '.join(str(a) for a in agents) or 'nothing'}\n"
-                            f"Explain this to the traveler."
-                        ),
-                    }
-                ]
-            },
-            config,
-        )
-        reasoning = result["structured_response"].reasoning or reasoning
+        # The manager node is not wrapped by `resilient_node` — it is the graph's
+        # own router, and a router that "degrades" would route nowhere. So the
+        # optional narration is contained here instead: prettier wording is
+        # never worth taking the run down for, and the template already says
+        # the same thing.
+        try:
+            decision = run_agent(
+                build_manager_agent(state),
+                (
+                    f"Trip request: {state.get('user_request', '')}\n"
+                    f"About to run: {', '.join(str(a) for a in agents) or 'nothing'}\n"
+                    f"Explain this to the traveler."
+                ),
+                role="manager",
+                collector=collector,
+            )
+            reasoning = decision.reasoning or reasoning
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:  # noqa: BLE001 - narration is optional
+            logger.warning("manager narration failed (%s); using the template", exc)
 
     return {
         "manager_decision": ManagerDecision(

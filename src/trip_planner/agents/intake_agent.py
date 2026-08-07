@@ -158,14 +158,48 @@ def _extract(request: str, collector=None) -> IntakeResult:
         return IntakeResult(profile=TravelerProfile())
 
 
+def _extra_missing(intake: IntakeResult, profile: TravelerProfile) -> list[str]:
+    """Keep the model's own "still missing" flags, minus the unusable ones.
+
+    The model is asked to leave `missing_fields` empty and mostly does, but not
+    always: it has returned `[""]`, and names that are not profile fields at
+    all. The old rule kept anything whose `getattr(profile, field, None)` was
+    empty — and `getattr(profile, "", None)` is None, so junk always passed.
+    One empty string was enough to make a complete profile look incomplete: the
+    planner stopped before it started, and asked the traveler the nonsense
+    question "Could you tell me ??".
+
+    Args:
+        intake: The agent's raw result.
+        profile: The profile after the memory merge.
+
+    Returns:
+        The names that are real, still-empty profile fields.
+    """
+    known = set(TravelerProfile.model_fields)
+    extra = []
+    for field in intake.missing_fields:
+        name = str(field).strip()
+        if not name or name in REQUIRED_FIELDS:
+            # Empty junk, or a required field the rule below already decides.
+            continue
+        if name not in known:
+            logger.warning("intake flagged '%s', which is not a profile field", name)
+            continue
+        if getattr(profile, name, None) in (None, "", [], 0):
+            extra.append(name)
+    return extra
+
+
 def _finalize(intake: IntakeResult) -> IntakeResult:
     """Merge stored preferences in, then decide completeness by rule.
 
     `validate_required_fields` is called here rather than by the model, so the
     answer is computed once from the profile that actually survived the merge.
-    Anything extra the model flagged is kept only while that field is genuinely
-    empty, and the question is regenerated to match — it can never go on naming
-    a field that memory has since filled.
+    Anything extra the model flagged is kept only while it names a real field
+    that is genuinely empty, and the question is regenerated to match — so it
+    can never go on naming a field that memory has since filled, nor a field
+    that does not exist.
 
     Args:
         intake: The agent's raw result.
@@ -188,12 +222,13 @@ def _finalize(intake: IntakeResult) -> IntakeResult:
     )
     missing: list[str] = list(checked["missing_fields"])
 
-    # Keep anything else the model flagged, unless the merge supplied it.
-    for field in intake.missing_fields:
-        if field not in REQUIRED_FIELDS and getattr(profile, field, None) in (None, ""):
-            missing.append(field)
+    # Keep anything else the model flagged, unless the merge supplied it or the
+    # name is unusable.
+    missing += _extra_missing(intake, profile)
 
-    question = ask_clarifying_question.invoke({"missing_fields": missing}) if missing else None
+    question = (
+        ask_clarifying_question.invoke({"missing_fields": missing}) if missing else None
+    )
 
     return intake.model_copy(
         update={

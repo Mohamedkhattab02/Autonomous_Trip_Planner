@@ -6,7 +6,7 @@ recommends one with its trade-offs stated.
 
 from __future__ import annotations
 
-from trip_planner.agents.factory import build_structured_agent
+from trip_planner.agents.factory import build_structured_agent, run_agent
 from trip_planner.schemas import AgentName, FlightsResult, TravelerProfile
 from trip_planner.state import TripState
 from trip_planner.tools import FLIGHT_TOOLS
@@ -86,14 +86,12 @@ def flights_node(state: TripState, collector=None) -> dict:
         A partial state update with the flight options.
     """
     profile = state["intake"].profile
-    agent = build_flights_agent()
-    if collector is not None:
-        # Route this agent's token and tool usage into the run metrics.
-        agent = agent.with_config(callbacks=[collector])
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": _flights_brief(profile)}]}
+    flights: FlightsResult = run_agent(
+        build_flights_agent(),
+        _flights_brief(profile),
+        role="flights",
+        collector=collector,
     )
-    flights: FlightsResult = result["structured_response"]
 
     return {
         "flights": flights,

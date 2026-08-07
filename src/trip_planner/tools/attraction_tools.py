@@ -9,6 +9,8 @@ festivals or seasonal events.
 
 from __future__ import annotations
 
+import os
+
 from langchain_core.tools import tool
 
 from trip_planner.tools.research_tools import tavily_web_search
@@ -16,6 +18,27 @@ from trip_planner.tools.serp import serp_search
 
 # How many places one search returns.
 MAX_PLACES = 10
+
+# How many places the whole pool may hold, across every query. Each result
+# carries coordinates, hours and a description, so an uncapped bulk search of
+# five interests put ~50 of them through the model - paid for once by the
+# Attractions Agent and again by Routing, for a pool no trip ever schedules.
+DEFAULT_MAX_TOTAL_PLACES = 15
+
+
+def max_total_places() -> int:
+    """How many places the pool may hold in total.
+
+    Read from the environment on every call rather than at import, so a test or
+    a run can change the size without reloading the module.
+
+    Returns:
+        `TRIP_MAX_PLACES` when it is a positive whole number, else 15.
+    """
+    raw = os.getenv("TRIP_MAX_PLACES", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return DEFAULT_MAX_TOTAL_PLACES
 
 WEEKDAYS = (
     "monday",
@@ -111,9 +134,10 @@ def search_places(query: str, destination: str) -> dict:
         return {"error": response["error"], "places": []}
 
     results = response.get("local_results", [])
+    limit = min(MAX_PLACES, max_total_places())
     places = [
         _summarize_place(index, result)
-        for index, result in enumerate(results[:MAX_PLACES], start=1)
+        for index, result in enumerate(results[:limit], start=1)
     ]
     if not places:
         return {"error": f"No places found for '{query}' in {destination}.", "places": []}
@@ -222,6 +246,11 @@ def search_places_bulk(queries: list[str], destination: str) -> dict:
     concurrently, so four interests cost roughly one search's worth of time
     instead of four.
 
+    The whole result is capped at `max_total_places()`, and the cap is spent a
+    rank at a time across the queries rather than query by query: the best hit
+    for every interest is taken before the second-best of any of them. That is
+    what keeps a small pool balanced instead of filling it with one interest.
+
     Args:
         queries: What to look for, one entry per interest, e.g.
             ["art museums", "seafood restaurants", "viewpoints"].
@@ -245,11 +274,24 @@ def search_places_bulk(queries: list[str], destination: str) -> dict:
     with ThreadPoolExecutor(max_workers=min(len(queries), 6)) as pool:
         responses = list(pool.map(run, queries))
 
+    ranked = [
+        [(query, result) for result in (response.get("local_results") or [])[:MAX_PLACES]]
+        for query, response in responses
+    ]
+
+    budget = max_total_places()
     places: list[dict] = []
     seen: set[str] = set()
     index = 1
-    for query, response in responses:
-        for result in (response.get("local_results") or [])[:MAX_PLACES]:
+    for rank in range(MAX_PLACES):
+        if len(places) >= budget:
+            break
+        for hits in ranked:
+            if len(places) >= budget:
+                break
+            if rank >= len(hits):
+                continue
+            query, result = hits[rank]
             key = result.get("place_id") or result.get("title", "")
             if not key or key in seen:
                 continue
@@ -265,7 +307,14 @@ def search_places_bulk(queries: list[str], destination: str) -> dict:
             "places": [],
             "queries_run": len(queries),
         }
-    return {"places": places, "queries_run": len(queries)}
+    return {
+        "places": places,
+        "queries_run": len(queries),
+        "note": (
+            f"This is the whole pool for this trip, capped at {budget} places. "
+            f"Do not search for more."
+        ),
+    }
 
 
 ATTRACTION_TOOLS.append(search_places_bulk)

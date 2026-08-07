@@ -78,10 +78,57 @@ SPECIALISTS: dict[str, tuple] = {
 
 # The graph revisits routing, budget and critic on a revision, so the step
 # limit has to exceed the longest legal path. LangGraph's default of 25 is low.
+# Each agent's own loop is bounded separately, by `factory.STEP_LIMITS`.
 RECURSION_LIMIT = 80
 
 # Where resumable runs are stored when checkpointing is on.
 CHECKPOINT_PATH = Path(__file__).resolve().parents[2] / ".checkpoints" / "trips.sqlite"
+
+
+@lru_cache(maxsize=1)
+def checkpoint_serializer():
+    """Return the serializer used for every checkpoint this project writes.
+
+    The state is almost entirely our own Pydantic models, and LangGraph now
+    warns on every one it deserializes without being told to expect it:
+
+        Deserializing unregistered type trip_planner.schemas.IntakeResult
+        from checkpoint. This will be blocked in a future version.
+
+    The warning is a real deprecation, not noise — resuming a run will stop
+    working once the block lands. Declaring the types answers it now, and the
+    list is derived from the modules rather than typed out, so a new schema
+    cannot be forgotten. Anything outside these two modules still has to be a
+    type LangGraph itself considers safe.
+
+    Returns:
+        A `JsonPlusSerializer` that expects this project's own types.
+    """
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    from trip_planner import metrics, schemas
+
+    allowed = [
+        value
+        for module in (schemas, metrics)
+        for value in vars(module).values()
+        if isinstance(value, type) and value.__module__ == module.__name__
+    ]
+    return JsonPlusSerializer(allowed_msgpack_modules=tuple(allowed))
+
+
+def _saver(connection):
+    """Build a SQLite checkpointer over an open connection.
+
+    Args:
+        connection: The SQLite connection to store checkpoints in.
+
+    Returns:
+        A `SqliteSaver` using this project's serializer.
+    """
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    return SqliteSaver(connection, serde=checkpoint_serializer())
 
 
 def _wrap(name: str, node, agent: AgentName):
@@ -207,11 +254,9 @@ def checkpointed_app():
 
     import sqlite3
 
-    from langgraph.checkpoint.sqlite import SqliteSaver
-
     CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(CHECKPOINT_PATH), check_same_thread=False)
-    return compile_graph(SqliteSaver(connection))
+    return compile_graph(_saver(connection))
 
 
 def run_config(thread_id: str) -> dict:
@@ -243,11 +288,16 @@ def plan_trip(user_request: str, thread_id: str | None = None) -> TripState:
     config: dict = {"recursion_limit": RECURSION_LIMIT}
 
     if thread_id and checkpointing_enabled():
-        from langgraph.checkpoint.sqlite import SqliteSaver
+        import sqlite3
 
         CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
         config["configurable"] = {"thread_id": thread_id}
-        with SqliteSaver.from_conn_string(str(CHECKPOINT_PATH)) as saver:
-            return compile_graph(saver).invoke(initial_state(user_request), config)
+        connection = sqlite3.connect(str(CHECKPOINT_PATH))
+        try:
+            return compile_graph(_saver(connection)).invoke(
+                initial_state(user_request), config
+            )
+        finally:
+            connection.close()
 
     return app.invoke(initial_state(user_request), config)

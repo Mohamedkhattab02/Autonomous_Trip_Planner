@@ -6,7 +6,7 @@ covering weather, safety, currency, transport and entry requirements.
 
 from __future__ import annotations
 
-from trip_planner.agents.factory import build_structured_agent
+from trip_planner.agents.factory import build_structured_agent, run_agent
 from trip_planner.schemas import AgentName, DestinationResearch, TravelerProfile
 from trip_planner.state import TripState
 from trip_planner.tools import RESEARCH_TOOLS
@@ -76,14 +76,12 @@ def research_node(state: TripState, collector=None) -> dict:
         A partial state update with the destination research.
     """
     profile = state["intake"].profile
-    agent = build_research_agent()
-    if collector is not None:
-        # Route this agent's token and tool usage into the run metrics.
-        agent = agent.with_config(callbacks=[collector])
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": _research_brief(profile)}]}
+    research: DestinationResearch = run_agent(
+        build_research_agent(),
+        _research_brief(profile),
+        role="destination_research",
+        collector=collector,
     )
-    research: DestinationResearch = result["structured_response"]
 
     return {
         "research": research,
