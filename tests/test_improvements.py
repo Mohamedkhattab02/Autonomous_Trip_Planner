@@ -688,7 +688,13 @@ class TestNodeIntegration:
         save_preferences(TravelerPreferences(default_currency="EUR"), "default")
 
         extracted = IntakeResult(
-            profile=TravelerProfile(destination="Rome"),
+            profile=TravelerProfile(
+                destination="Rome",
+                start_date=date(2026, 4, 2),
+                end_date=date(2026, 4, 6),
+                travelers=2,
+                budget_amount=2000,
+            ),
             missing_fields=["budget_currency"],
         )
         monkeypatch.setattr(
@@ -696,6 +702,37 @@ class TestNodeIntegration:
         )
         update = intake_agent.intake_node({"user_request": "Rome"})
         assert update["intake"].missing_fields == []
+
+    def test_an_empty_required_field_is_missing_even_if_the_model_says_otherwise(
+        self, tmp_path, monkeypatch
+    ):
+        """Completeness is a rule of the system, not the model's opinion.
+
+        A small model that under-reports `missing_fields` used to make intake
+        look complete, and the manager then dispatched five agents against a
+        profile with no dates.
+        """
+        from trip_planner.agents import intake_agent
+
+        monkeypatch.setattr("trip_planner.memory.PROFILES_DIR", tmp_path)
+
+        extracted = IntakeResult(
+            profile=TravelerProfile(destination="Rome"), missing_fields=[]
+        )
+        monkeypatch.setattr(
+            intake_agent, "build_intake_agent", lambda: StubAgent(extracted)
+        )
+        update = intake_agent.intake_node({"user_request": "Rome"})
+
+        intake = update["intake"]
+        assert set(intake.missing_fields) == {
+            "start_date",
+            "end_date",
+            "travelers",
+            "budget_amount",
+        }
+        assert intake.clarifying_question, "a missing field must produce a question"
+        assert not intake.is_complete
 
 
 # ---------------------------------------------------------------------------
@@ -905,8 +942,10 @@ class TestInterruptRegression:
         monkeypatch.setattr("trip_planner.memory.PROFILES_DIR", tmp_path)
         monkeypatch.setenv("TRIP_ASK_USER", "true")
 
+        # Everything except the dates, so the only missing fields are the ones
+        # asserted on below — the node recomputes them from `REQUIRED_FIELDS`.
         incomplete = IntakeResult(
-            profile=TravelerProfile(destination="Rome"),
+            profile=TravelerProfile(destination="Rome", travelers=2, budget_amount=2000),
             missing_fields=["start_date", "end_date"],
             clarifying_question="When does the trip start and end?",
         )
@@ -953,7 +992,7 @@ class TestInterruptRegression:
 
         seen: list[str] = []
         incomplete = IntakeResult(
-            profile=TravelerProfile(destination="Rome"),
+            profile=TravelerProfile(destination="Rome", travelers=2, budget_amount=2000),
             missing_fields=["start_date", "end_date"],
             clarifying_question="When does the trip start and end?",
         )

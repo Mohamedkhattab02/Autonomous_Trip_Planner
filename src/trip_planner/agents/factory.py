@@ -43,7 +43,8 @@ def build_structured_agent(
 
     Args:
         role: The agent's name, used to pick a per-agent model override.
-        tools: The tools this agent may call.
+        tools: The tools this agent may call. Empty for an agent whose job is
+            pure extraction — see `intake_agent`.
         system_prompt: The agent's instructions.
         response_format: The Pydantic model the agent must produce.
         name: A readable name for tracing.
